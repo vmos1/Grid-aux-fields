@@ -1,0 +1,2391 @@
+// gen_qcd_hasenbusch_tune_compact_schur.cc
+//
+// LEAN + FAST variant: compact-clover storage (CompactWilsonCloverFermion, ~6x
+// smaller host footprint → fits 48^3x96 on 2 nodes) AND an EO-Schur light sector
+// (vs the unpreconditioned full-operator "Tail" in gen_qcd_hasenbusch_tune_compact.cc).
+// The two axes are orthogonal — see __docs/2026_6_21_compact_vs_eoschur.md.  The light
+// det(M_l)^2 is represented in the SAME EO-Schur form the production 2+1 driver uses
+// (TwoFlavourSchurCloverAction monomial + QCDLogDetCompactCloverEOAction, plus
+// TwoFlavourEvenOddRatio levels when HASEN_LADDER is set).  Forked from
+// gen_qcd_hasenbusch_tune_compact.cc; only the LIGHT sector differs.
+//
+// Standalone Hasenbusch mass tuning for 2+1f Wilson-clover QCD.
+// Intended for the cl21_48_96_b6p3_m0p2416_m0p2050 ensemble (or any ensemble
+// with env-var overrides).  Built with the TXQCD production Makefile so QUDA
+// is available for the strange RHMC force.
+//
+// Physics: represents det(M_l)^2 as a Hasenbusch ratio chain (HASEN_LADDER)
+//          capped by a bare-det tail at the heaviest ladder mass, matching the
+//          Chroma cfg_2000 action (no Pauli-Villars).
+// Prints a "FORCES traj=N ..." line per trajectory for easy grep + analysis.
+// Checkpointing (2026-07-08, roadmap D): opt-in via CKPT_DIR — per-trajectory
+// ILDG .lime config + RNG state, with CKPT_RESUME_TRAJ stream resume.  Unset =
+// the original no-output tuning behavior.  See the Checkpointer block in main.
+//
+// Key env vars:
+//   HASEN_LADDER   Comma-separated masses light→heavy, e.g.
+//                  "-0.2416,-0.2400,-0.2320,-0.2180,-0.1870"
+//                  Lightest must equal MASS_LIGHT. Heaviest entry is the
+//                  bare-det tail mass (no Pauli-Villars is appended).
+//   HASEN_TAIL_LEVEL  "outer" (default) = tail integrates with the ladder
+//                  rungs; "inner" = tail on the fine gauge level — Chroma's
+//                  actual has_cancel_2flav placement (cfg_2000 XML puts it in
+//                  the inner n_steps=2 sub-integrator WITH lw_tree_gauge).
+//   HASEN_QUDA_CG_TAIL  Set to 1 to run the tail's deriv (cg_tol_drv) and
+//                  action (cg_tol_act) solves through plain QUDA CG instead of
+//                  Grid mixed-precision CG.  The tail heatbath needs no solve
+//                  (phi = Mpc^dag eta), so it has no QUDA variant.
+//   HASEN_GRID_MG_RUNGS  Comma-separated ratio-rung indices (the k of "PF<k>")
+//                  whose deriv/action solves run through the pure-Grid multigrid
+//                  (src/grid_mg/, tunables GRID_MG_*); the lowest listed rung
+//                  donates the one shared hierarchy.  Unset = Grid CG as before.
+//   HASEN_GRID_MG_HEATBATH_RUNGS  Ratio rungs (each also in HASEN_GRID_MG_RUNGS) whose
+//                  heatbath solve (mass ladder[k+1]) runs through the same hierarchy.
+//   HASEN_GRID_MIXED_CG_RUNGS  Ratio rungs (none in HASEN_GRID_MG_RUNGS) whose deriv and
+//                  action solves run Grid mixed-precision CG (one solver, cg_tol_drv).
+//   HASEN_GRID_MIXED_CG_HEATBATH_RUNGS  Ratio rungs (none in HASEN_GRID_MG_HEATBATH_RUNGS)
+//                  whose heatbath runs Grid mixed-precision CG (cg_tol_act).  All three:
+//                  unset = the plain Grid CG route, byte-identical.
+//   HASEN_GRID_FUSED_CLOVER_FORCE  1 = fused clover force (M5 fix 2, src/clover_force/): the
+//                  ratio rungs, the tail and the strange MP RHMC accumulate their MooDeriv/MeeDeriv
+//                  outer products and run ONE clover-derivative pass per force call.  Unset,
+//                  empty or 0 = the per-call derivatives, byte-identical; other values exit(1).
+//   N_TRAJ         Number of trajectories (default 5)
+//   MDSTEPS        MD steps per trajectory (default 20)
+//   IMPORT_CFG     Path to starting gauge config (NERSC or Chroma LIME)
+//   QUDA_FORCE     Set to 1 to use QUDA for strange RHMC force
+//   MASS_LIGHT     Light quark mass (default -0.2416 for this ensemble)
+//   MASS_STRANGE   Strange quark mass (default -0.2050)
+//   CSW            Clover coefficient (default 1.20537)
+//   BETA           Gauge coupling (default 6.3)
+//   U0             Mean-field u0 for LW rect coefficient (default 1.0 = tree-level)
+//   GAUGE_INNER_MULT  Gauge sub-steps per fermion step (default 4)
+//
+// Compile: listed in production/Makefile PROGRAMS — built by default.
+// Run:     see ~/projects/grid_qcd/jobs/tune-hasenbusch.sbatch
+
+#include "params.h"
+#include <chrono>
+#include <cstring>
+#include <iomanip>
+#include <set>
+#include <sstream>
+#include <Grid/Grid.h>
+#include <Grid/parallelIO/IldgIO.h>
+#include <Grid/qcd/action/pseudofermion/QCDLogDetCompactCloverEOAction.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverAction.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioAction.h>
+#include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalActionMP.h>
+// EVEN-parity Grid-native Schur monomial — same parity as the QUDA force path,
+// opt-in via STRANGE_EVEN=1 for same-parity grid-vs-quda force validation.
+#include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalActionEven.h>
+#include <Grid/qcd/action/gauge/PlaqPlusRectangleAction.h>
+#include <Grid/qcd/observables/plaquette.h>
+#include <Grid/qcd/observables/polyakov_loop.h>
+#include <Grid/algorithms/iterative/ConjugateGradientMixedPrec.h>
+#include <Grid/algorithms/iterative/ConjugateGradientMultiShiftMixedPrec.h>
+// Pure-Grid multigrid rung solver (HASEN_GRID_MG_RUNGS, _HEATBATH_RUNGS) and mixed-precision CG
+// rung solver (HASEN_GRID_MIXED_CG_RUNGS, _HEATBATH_RUNGS): header-only, in src/grid_mg/ (see
+// its PROVENANCE.md).  Nothing in them runs unless one of those variables is set.
+#include "grid_mg/grid_mg_schur_solver.h"
+#include "grid_mg/mixed_cg_rung_solver.h"
+#include "grid_mg/ratio_action_rung_solver.h"
+// Fused clover force (HASEN_GRID_FUSED_CLOVER_FORCE): header-only, src/clover_force/; the
+// carried action headers include it too.  Nothing in it runs unless the variable is 1.
+#include <Grid/qcd/action/pseudofermion/hasen/fused_clover_force.h>
+#ifdef GRID_HAVE_QUDA
+#include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverQudaForceRationalActionMP.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioActionQuda.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioQudaForceAction.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverQudaForceTailAction.h>
+#include <Grid/qcd/action/pseudofermion/QCDLogDetCompactCloverEOQudaForceAction.h>
+#include <Grid/algorithms/iterative/QudaMGSchurSolver.h>
+#include <Grid/algorithms/iterative/QudaCGSchurSolver.h>
+#endif
+
+using namespace Grid;
+using namespace TXQCDProduction;
+
+// ---------------------------------------------------------------------------
+// Subclass of TwoFlavourSchurCloverAction that re-syncs the SP operator from the
+// raw gauge field before each deriv(), delegating the CG work to the MP wrapper
+// installed as the DerivativeSolver.  Copied verbatim from the production 2+1
+// driver (gen_qcd_cfgs_2plus1.cc) so the light Schur tail can run a mixed-precision
+// force on the compact operator.  Templated on the operator types → binds to
+// CompactWilsonCloverFermion (the FermOpD_/FermOpF_ args below).
+// ---------------------------------------------------------------------------
+namespace Grid {
+template <class ImplD, class ImplF,
+          class FermOpD_ = WilsonCloverFermion<ImplD, CloverHelpers<ImplD>>,
+          class FermOpF_ = WilsonCloverFermion<ImplF, CloverHelpers<ImplF>>>
+class TwoFlavourSchurCloverActionMP
+    : public TwoFlavourSchurCloverAction<ImplD, FermOpD_> {
+ public:
+  typedef TwoFlavourSchurCloverAction<ImplD, FermOpD_> Base;
+  typedef FermOpD_ FermOpD;
+  typedef FermOpF_ FermOpF;
+  typedef typename ImplD::GaugeField GaugeField;
+
+  TwoFlavourSchurCloverActionMP(typename Base::FermionOperator &opD,
+                                FermOpF &opF,
+                                OperatorFunction<typename Base::FermionField> &DS,
+                                OperatorFunction<typename Base::FermionField> &AS)
+      : Base(opD, DS, AS), opF_(opF) {}
+
+  void deriv(const GaugeField &U, GaugeField &dSdU) override {
+    // Refresh SP operator from the raw gauge field U (per-mu precisionChange).
+    typename ImplF::GaugeField UmuF(opF_.GaugeGrid());
+    typename ImplD::GaugeLinkField U_d(U.Grid());
+    typename ImplF::GaugeLinkField U_f(opF_.GaugeGrid());
+    for (int mu = 0; mu < Nd; ++mu) {
+      U_d = PeekIndex<LorentzIndex>(U, mu);
+      precisionChange(U_f, U_d);
+      PokeIndex<LorentzIndex>(UmuF, U_f, mu);
+    }
+    opF_.ImportGauge(UmuF);
+    Base::deriv(U, dSdU);
+  }
+
+ private:
+  FermOpF &opF_;
+};
+}  // namespace Grid
+
+// ---------------------------------------------------------------------------
+// Tail variant with QUDA-CG deriv/action solves (HASEN_QUDA_CG_TAIL=1).
+// Derives from the plain DP action (QUDA does its own precision handling, so
+// the SP-operator resync of the MP variant above is dead weight here) and
+// keeps the QUDA solvers' resident gauge in sync before each solve — the same
+// override pattern TwoFlavourSchurCloverRatioActionQuda uses for the ladder
+// rungs.  refresh() is untouched: the bare-det heatbath is an application
+// (phi = Mpc^dag eta), no solve.
+// ---------------------------------------------------------------------------
+#ifdef GRID_HAVE_QUDA
+namespace Grid {
+template <class ImplD, class FermOpD_>
+class TwoFlavourSchurCloverActionQudaTail
+    : public TwoFlavourSchurCloverAction<ImplD, FermOpD_> {
+ public:
+  typedef TwoFlavourSchurCloverAction<ImplD, FermOpD_> Base;
+  typedef typename ImplD::GaugeField GaugeField;
+
+  TwoFlavourSchurCloverActionQudaTail(typename Base::FermionOperator &opD,
+                                      QudaRungSolverBase &DS,
+                                      QudaRungSolverBase &AS)
+      : Base(opD, DS, AS), quda_ds_(DS), quda_as_(AS) {}
+
+  RealD S(const GaugeField &U) override {
+    quda_as_.SetGauge(U);
+    return Base::S(U);
+  }
+
+  void deriv(const GaugeField &U, GaugeField &dSdU) override {
+    quda_ds_.SetGauge(U);
+    Base::deriv(U, dSdU);
+  }
+
+ private:
+  QudaRungSolverBase &quda_ds_;
+  QudaRungSolverBase &quda_as_;
+};
+}  // namespace Grid
+#endif
+
+// ---------------------------------------------------------------------------
+// Mixed-precision CG wrapper — used for the strange RHMC force solver.
+// ---------------------------------------------------------------------------
+template <class FieldD, class FieldF, class SchurOpD, class SchurOpF>
+class MixedPrecCGWrapper : public OperatorFunction<FieldD> {
+ public:
+  using OperatorFunction<FieldD>::operator();
+
+  MixedPrecCGWrapper(RealD tol, int max_inner, int max_outer,
+                     GridBase *rbgrid_f, SchurOpD &schur_d, SchurOpF &schur_f)
+      : tol_(tol), max_inner_(max_inner), max_outer_(max_outer),
+        rbgrid_f_(rbgrid_f), schur_d_(schur_d), schur_f_(schur_f) {}
+
+  void operator()(LinearOperatorBase<FieldD> &, const FieldD &src,
+                  FieldD &sol) override {
+    MixedPrecisionConjugateGradient<FieldD, FieldF> MPCG(
+        tol_, max_inner_, max_outer_, rbgrid_f_, schur_f_, schur_d_);
+    MPCG(src, sol);
+  }
+
+ private:
+  RealD tol_; int max_inner_, max_outer_;
+  GridBase *rbgrid_f_;
+  SchurOpD &schur_d_; SchurOpF &schur_f_;
+};
+
+// ---------------------------------------------------------------------------
+// ForceNormObserver: prints one grep-able FORCES line per trajectory.
+// Format: FORCES traj=N PF0=X PF1=X ... Tail=X Strange=X Gauge=X
+// ---------------------------------------------------------------------------
+struct ForceNormObserver : public HmcObservable<LatticeGaugeField> {
+  struct Ref { std::string name; Action<LatticeGaugeField> *act; };
+  std::vector<Ref> refs;
+
+  void TrajectoryComplete(int traj, LatticeGaugeField &,
+                          GridSerialRNG &, GridParallelRNG &) override {
+    std::cout << GridLogMessage << "FORCES traj=" << traj;
+    for (auto &r : refs)
+      std::cout << " " << r.name << "=" << r.act->deriv_norm_average();
+    std::cout << std::endl;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+int main(int argc, char **argv) {
+  Grid_init(&argc, &argv);
+
+  // ── Grid setup ────────────────────────────────────────────────────────────
+  Coordinate latt = lattice_size();
+  Coordinate simd = GridDefaultSimd(Nd, vComplex::Nsimd());
+  Coordinate mpi  = GridDefaultMpi();
+  GridCartesian         Grid_(latt, simd, mpi);
+  GridRedBlackCartesian RBGrid_(&Grid_);
+
+  // Single-precision grids for mixed-precision strange RHMC.
+  GridCartesian         GridF(latt, GridDefaultSimd(Nd, vComplexF::Nsimd()), mpi);
+  GridRedBlackCartesian RBGridF(&GridF);
+
+  // ── Run parameters ────────────────────────────────────────────────────────
+  int n_traj  = 5;
+  int mdsteps = 20;
+  if (const char *nt = std::getenv("N_TRAJ");  nt && *nt) n_traj  = std::atoi(nt);
+  if (const char *ms = std::getenv("MDSTEPS"); ms && *ms) mdsteps = std::atoi(ms);
+  std::cout << GridLogMessage << "N_TRAJ=" << n_traj
+            << "  MDSTEPS=" << mdsteps << std::endl;
+
+  // ── TRAJL is MANDATORY for HMC (no compiled-in default) ─────────────────────
+  // A silent trajL default lets this driver disagree with another driver's
+  // trajectory length (the 2+1 driver defaults to sqrt(2); this one used to
+  // default to 1.0), making HMC timings non-comparable.  Require TRAJL explicitly
+  // and fail fast HERE — before the (5.7 GB at 48^3) config load.  Forces-only
+  // runs don't use the integrator, so they are exempt.
+  if (std::getenv("FORCES_ONLY") == nullptr) {
+    const char *tl = std::getenv("TRAJL");
+    if (!tl || !*tl) {
+      std::cout << GridLogMessage
+                << "FATAL: TRAJL is not set.  This driver has no default trajectory "
+                   "length for HMC — set it explicitly, e.g. "
+                   "TRAJL=0.35355339059327379 (sqrt(2)/4, the benchmark value)."
+                << std::endl;
+      Grid_finalize();
+      return 1;
+    }
+  }
+
+  // ── Hasenbusch ladder ─────────────────────────────────────────────────────
+  // HASEN_LADDER: comma-separated masses, strictly increasing (light→heavy).
+  // Lightest entry must equal MASS_LIGHT.  Heaviest entry is the bare-det Tail
+  // mass (no Pauli-Villars is appended — see note below).
+  // If unset: single-level (no Hasenbusch) — use for baseline timing.
+  std::vector<RealD> ladder;
+  if (const char *hl = std::getenv("HASEN_LADDER"); hl && *hl) {
+    std::string s(hl); size_t pos = 0, c;
+    while ((c = s.find(',', pos)) != std::string::npos) {
+      ladder.push_back(std::atof(s.substr(pos, c - pos).c_str())); pos = c + 1;
+    }
+    if (pos < s.size()) ladder.push_back(std::atof(s.substr(pos).c_str()));
+    if (ladder.size() < 2) { std::cerr << "HASEN_LADDER needs ≥2 masses.\n"; exit(1); }
+    for (size_t i = 1; i < ladder.size(); ++i)
+      if (!(ladder[i] > ladder[i-1])) {
+        std::cerr << "HASEN_LADDER must be strictly increasing.\n"; exit(1);
+      }
+  } else {
+    ladder = { mass_light };
+    std::cout << GridLogMessage << "HASEN_LADDER not set — single-level baseline." << std::endl;
+  }
+  // No Pauli-Villars: the chain is capped by a bare-det tail on the heaviest
+  // ladder mass (ladder.back()), matching the Chroma cfg_2000 action
+  // (TWO_FLAVOR_EOPREC_CONSTDET_FERM_MONOMIAL at -0.1870), so the telescoping
+  // recovers det(M_l)^2 exactly with no leftover PV factor.
+
+  std::cout << GridLogMessage << "Hasenbusch chain (" << (ladder.size()-1)
+            << " ratios + bare-det tail at " << ladder.back() << "):";
+  for (auto m : ladder) std::cout << " " << m;
+  std::cout << std::endl;
+
+  // ── RNG ───────────────────────────────────────────────────────────────────
+  // HMC_SEED_OFFSET=k shifts every seed integer by k, giving an independent
+  // momentum/pseudofermion stream. Unset/0 = the historical fixed seeds, so
+  // all previous runs stay bit-reproducible.
+  GridSerialRNG   sRNG;
+  GridParallelRNG pRNG(&Grid_);
+  int seed_off = 0;
+  if (const char *so = std::getenv("HMC_SEED_OFFSET")) seed_off = std::atoi(so);
+  if (seed_off)
+    std::cout << GridLogMessage << "HMC_SEED_OFFSET=" << seed_off << std::endl;
+  sRNG.SeedFixedIntegers({11 + seed_off, 12 + seed_off, 13 + seed_off,
+                          14 + seed_off, 15 + seed_off});
+  pRNG.SeedFixedIntegers({16 + seed_off, 17 + seed_off, 18 + seed_off,
+                          19 + seed_off, 20 + seed_off});
+
+  // ── Checkpointer (roadmap D: config I/O) ──────────────────────────────────
+  // CKPT_DIR=<dir> enables per-trajectory checkpointing via Grid's stock
+  // ILDGHmcCheckpointer: gauge -> <dir>/ckpoint_lat.<traj> (ILDG .lime,
+  // readable back through this driver's own IMPORT_CFG path and by Chroma
+  // tooling), full RNG state (serial+parallel) -> <dir>/ckpoint_rng.<traj>.
+  // Unset = no checkpointing — the old behavior (accepted configs are lost).
+  //   CKPT_INTERVAL=<n>     save every n-th trajectory (default 1).
+  //   CKPT_START_TRAJ=<n>   trajectory-numbering offset for a FRESH start from
+  //                         IMPORT_CFG (e.g. 2000 -> first save ckpoint_lat.2001).
+  //   CKPT_RESUME_TRAJ=<n>  resume a stream: restore gauge + BOTH RNGs from
+  //                         <dir>/ckpoint_{lat,rng}.<n> (IMPORT_CFG ignored, the
+  //                         fixed seeds above overwritten) and continue at n+1.
+  // Checkpoints are written after EVERY trajectory incl. rejects (the RNG state
+  // must advance for stream continuity; a rejected trajectory re-saves the
+  // reverted gauge field with the post-reject RNG).
+  std::unique_ptr<ILDGHmcCheckpointer<PeriodicGimplR>> Ckpt;
+  int ckpt_start = 0;
+  if (const char *cd = std::getenv("CKPT_DIR"); cd && *cd) {
+    CheckpointerParameters cp;
+    cp.config_prefix  = std::string(cd) + "/ckpoint_lat";
+    cp.smeared_prefix = std::string(cd) + "/ckpoint_lat_smr";
+    cp.rng_prefix     = std::string(cd) + "/ckpoint_rng";
+    cp.saveInterval   = 1;
+    if (const char *ci = std::getenv("CKPT_INTERVAL"); ci && *ci)
+      cp.saveInterval = std::atoi(ci);
+    cp.saveSmeared    = false;
+    cp.format         = "IEEE64BIG";
+    Ckpt = std::make_unique<ILDGHmcCheckpointer<PeriodicGimplR>>(cp);
+    std::cout << GridLogMessage << "[Ckpt] CKPT_DIR=" << cd
+              << " interval=" << cp.saveInterval << std::endl;
+  }
+  if (const char *st = std::getenv("CKPT_START_TRAJ"); st && *st)
+    ckpt_start = std::atoi(st);
+  int ckpt_resume = -1;
+  if (const char *rt = std::getenv("CKPT_RESUME_TRAJ"); rt && *rt)
+    ckpt_resume = std::atoi(rt);
+  if (ckpt_resume >= 0 && !Ckpt) {
+    std::cout << GridLogMessage
+              << "FATAL: CKPT_RESUME_TRAJ requires CKPT_DIR." << std::endl;
+    Grid_finalize();
+    return 1;
+  }
+
+  // ── Gauge field ───────────────────────────────────────────────────────────
+  LatticeGaugeField Umu(&Grid_);
+  if (ckpt_resume >= 0) {
+    std::cout << GridLogMessage << "[Ckpt] CKPT_RESUME_TRAJ=" << ckpt_resume
+              << " — restoring gauge + RNG state (IMPORT_CFG ignored)" << std::endl;
+    Ckpt->CheckpointRestore(ckpt_resume, Umu, sRNG, pRNG);
+    ckpt_start = ckpt_resume;
+  } else if (const char *ic = std::getenv("IMPORT_CFG"); ic && *ic) {
+    std::cout << GridLogMessage << "IMPORT_CFG=" << ic << std::endl;
+    FILE *fp = std::fopen(ic, "rb"); char magic[16] = {0};
+    if (fp) { std::fread(magic, 1, sizeof(magic), fp); std::fclose(fp); }
+    FieldMetaData header;
+    if (std::memcmp(magic, "BEGIN_HEADER", 12) == 0) {
+      NerscIO::readConfiguration<GaugeStatistics<PeriodicGimplR>>(Umu, header, std::string(ic));
+    } else {
+      IldgReader IR; IR.open(std::string(ic));
+      IR.readConfiguration(Umu, header); IR.close();
+    }
+  } else {
+    std::cout << GridLogMessage << "No IMPORT_CFG — cold start." << std::endl;
+    SU<Nc>::ColdConfiguration(pRNG, Umu);
+  }
+
+  // Plaquette of the loaded/initial gauge field — validates that IMPORT_CFG was
+  // read correctly (compare to the ensemble reference, e.g. cfg_2000 ≈ 0.54351).
+  std::cout << GridLogMessage << "Initial plaquette = "
+            << std::setprecision(10)
+            << WilsonLoops<PeriodicGimplR>::avgPlaquette(Umu) << std::endl;
+
+  // ── Fermion operator setup ────────────────────────────────────────────────
+  // Compact operator must use CompactCloverHelpers — that is what libGrid
+  // explicitly instantiates (CloverHelpers would link-fail).
+  typedef CompactWilsonCloverFermion<WilsonImplR, CompactCloverHelpers<WilsonImplR>> WCF;
+  typedef CompactWilsonCloverFermion<WilsonImplF, CompactCloverHelpers<WilsonImplF>> WCF_f;
+
+  // SP gauge field for mixed-precision strange.
+  LatticeGaugeFieldF UmuF(&GridF);
+  {
+    LatticeColourMatrix  Ud(&Grid_); LatticeColourMatrixF Uf(&GridF);
+    for (int mu = 0; mu < Nd; ++mu) {
+      Ud = PeekIndex<LorentzIndex>(Umu, mu);
+      precisionChange(Uf, Ud);
+      PokeIndex<LorentzIndex>(UmuF, Uf, mu);
+    }
+  }
+
+  // Antiperiodic BC in time (matches Chroma <boundary>1 1 1 -1</boundary>).
+  WilsonImplParams impl_p, impl_pF;
+  impl_p.boundary_phases  = std::vector<Complex>({1., 1., 1., -1.});
+  impl_pF.boundary_phases = std::vector<Complex>({1., 1., 1., -1.});
+  WilsonAnisotropyCoefficients anis;
+
+  // One DP light operator per ladder mass (heaviest = bare-det tail mass; no PV).
+  // Hasenbusch ratios have small Δm → CG is well-conditioned → DP only needed.
+  int n_ops = (int)ladder.size();
+  std::vector<std::unique_ptr<WCF>> LightOps;
+  for (int i = 0; i < n_ops; ++i)
+    LightOps.emplace_back(std::make_unique<WCF>(
+        Umu, Grid_, RBGrid_, ladder[i], csw, csw, /*cF=*/1.0, anis, impl_p));
+  std::cout << GridLogMessage << "Built " << n_ops << " DP light operators." << std::endl;
+
+  // SP light operators (one per ladder mass) for the mixed-precision light Schur
+  // MD force — mirrors the strange DP+SP pattern below.
+  std::vector<std::unique_ptr<WCF_f>> LightOpsF;
+  for (int i = 0; i < n_ops; ++i)
+    LightOpsF.emplace_back(std::make_unique<WCF_f>(
+        UmuF, GridF, RBGridF, ladder[i], csw, csw, /*cF=*/1.0, anis, impl_pF));
+
+  // Strange: DP + SP for mixed-precision multishift RHMC.
+  WCF   StrangeOp (Umu,  Grid_,  RBGrid_,  mass_strange, csw, csw, /*cF=*/1.0, anis, impl_p);
+  WCF_f StrangeOpF(UmuF, GridF, RBGridF,  mass_strange, csw, csw, /*cF=*/1.0, anis, impl_pF);
+
+  // ── Solvers ───────────────────────────────────────────────────────────────
+  // CG tolerances are env-overridable for fast Hasenbusch mass tuning — the force
+  // norms used for tuning are insensitive to solve precision.  Defaults reproduce
+  // production (action/heatbath 1e-8, force 1e-6); e.g. TUNE_CG_TOL_ACTION=1e-4
+  // TUNE_CG_TOL_DERIV=1e-4 cuts the dominant light-quark solves substantially.
+  const RealD cg_tol_act = TXQCDProduction::detail::env_real("TUNE_CG_TOL_ACTION", cg_tol);
+  const RealD cg_tol_drv = TXQCDProduction::detail::env_real("TUNE_CG_TOL_DERIV", 1e-6);
+  // TUNE_CG_TOL_STRANGE loosens the strange RHMC's multishift CG (otherwise
+  // pinned to the production cg_tol regardless of TUNE_CG_TOL_*) — only
+  // matters when the strange sector is actually evaluated (full HMC, or
+  // FORCES_ONLY without FORCES_SKIP_STRANGE).
+  const RealD cg_tol_strange = TXQCDProduction::detail::env_real("TUNE_CG_TOL_STRANGE", cg_tol);
+  std::cout << GridLogMessage << "CG tol: action/heatbath=" << cg_tol_act
+            << " deriv=" << cg_tol_drv << " strange=" << cg_tol_strange << std::endl;
+  ConjugateGradient<LatticeFermion> CG_action(cg_tol_act, cg_max);  // ratio S() + heatbath
+  ConjugateGradient<LatticeFermion> CG_deriv(cg_tol_drv,  cg_max);  // ratio deriv()
+
+  SchurDifferentiableOperator<WilsonImplR> StrangeSchurOpD(StrangeOp);
+  SchurDifferentiableOperator<WilsonImplF> StrangeSchurOpF(StrangeOpF);
+  MixedPrecCGWrapper<LatticeFermion, LatticeFermionF,
+                     SchurDifferentiableOperator<WilsonImplR>,
+                     SchurDifferentiableOperator<WilsonImplF>>
+      CG_strange_md(1e-6, cg_max, 50, &RBGridF, StrangeSchurOpD, StrangeSchurOpF);
+
+  // ── HASEN_GRID_FUSED_CLOVER_FORCE: fused clover force (M5 fix 2) ────────────
+  // 1 = the carried TwoFlavourSchurCloverRatioAction, TwoFlavourSchurCloverAction (tail) and
+  // OneFlavourSchurCloverRationalActionMP (strange) derivs accumulate their MooDeriv/MeeDeriv
+  // outer products into one field and run ONE clover pass per force call
+  // (src/clover_force/fused_clover_force.h; __docs/2026_09_30_pure_grid_force_cost_analysis.md
+  // section 5 fix 2).  Hopping derivatives, LogDets and STRANGE_EVEN are untouched.  Exact up to
+  // summation order.  Strict parse: unset, empty or 0 = per-call derivatives (byte-identical,
+  // nothing printed); 1 = on (one log line here, one per action at its first fused pass).
+  if (const char *v = std::getenv("HASEN_GRID_FUSED_CLOVER_FORCE"); v && *v) {
+    const std::string s(v);
+    if (s == "1") {
+      FusedCloverForceEnabled() = true;
+      std::cout << GridLogMessage
+                << "HASEN_GRID_FUSED_CLOVER_FORCE=1: fused clover force ON (ratio rungs, tail, "
+                   "strange MP RHMC: one accumulated outer product, one clover pass per force call)"
+                << std::endl;
+    } else if (s != "0") {
+      std::cerr << "HASEN_GRID_FUSED_CLOVER_FORCE=" << v << ": must be 0 or 1.\n";
+      exit(1);
+    }
+  }
+
+  // ── Actions ───────────────────────────────────────────────────────────────
+  // EO-SCHUR light sector (vs the full-operator "Tail" in the compact driver).
+  //   det(M_l)^2 = [Π_k det(Schur(m_k))^2 / det(Schur(m_{k+1}))^2] · det(Schur(m_last))^2
+  //                × det(M_ee(m_0))^2
+  // The Schur ratios are EO ratio actions; the Schur tail is an EO-Schur monomial; the
+  // clover-block (M_ee) determinants telescope across the ladder to a SINGLE log-det at the
+  // LIGHTEST mass (Nf=2).  Single-level baseline (no HASEN_LADDER) → one Schur monomial + one
+  // light log-det, exactly the production 2+1 driver's light sector.  (The ladder's M_ee
+  // bookkeeping is validated by ΔH — Target B.)
+
+  // Light EO log-det: det(M_ee(mass_light))^2  (Nf=2; lightest mass = LightOps[0]).
+  QCDLogDetCompactCloverEOAction<WilsonImplR> LightLogDet(*LightOps[0], 2);
+  LightLogDet.is_smeared = true;
+  Action<LatticeGaugeField> *LightLogDetPtr = &LightLogDet;
+
+  // HASEN_QUDA_FORCE_LOGDET=<light|strange|light,strange|all> routes the LogDet
+  // FORCE (the sigma_munu-trace clover derivative -- the one light piece v1 left
+  // in Grid) onto QUDA's fused sigma-trace kernel
+  // (QCDLogDetCompactCloverEOQudaForceAction).  S() stays Grid (cheap, twice per
+  // traj).  Default unset -> Grid base action, deriv bit-identical.
+  bool quda_force_logdet_light = false, quda_force_logdet_strange = false;
+  if (const char *v = std::getenv("HASEN_QUDA_FORCE_LOGDET"); v && *v) {
+    std::string s(v);
+    const bool all = (s == "all");
+    quda_force_logdet_light   = all || s.find("light")   != std::string::npos;
+    quda_force_logdet_strange = all || s.find("strange") != std::string::npos;
+  }
+#ifdef GRID_HAVE_QUDA
+  std::unique_ptr<QCDLogDetCompactCloverEOQudaForceAction<WilsonImplR>> LightLogDetQuda;
+  if (quda_force_logdet_light) {
+    QudaCloverParams qp_ld;
+    qp_ld.mass = ladder[0]; qp_ld.csw = csw; qp_ld.anti_periodic_t = true;
+    qp_ld.tol = cg_tol_drv; qp_ld.max_iter = cg_max;
+    qp_ld.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+    qp_ld.use_multigrid = false;
+    if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+      qp_ld.recon_sloppy = QUDA_RECONSTRUCT_NO;
+    LightLogDetQuda = std::make_unique<
+        QCDLogDetCompactCloverEOQudaForceAction<WilsonImplR>>(*LightOps[0], 2, qp_ld);
+    LightLogDetQuda->is_smeared = true;
+    LightLogDetPtr = LightLogDetQuda.get();
+    std::cout << GridLogMessage
+              << "[Ladder] LIGHT LogDet FORCE ASSEMBLY = QUDA sigma-trace kernel"
+              << std::endl;
+  }
+#else
+  if (quda_force_logdet_light || quda_force_logdet_strange) {
+    std::cerr << "HASEN_QUDA_FORCE_LOGDET requires a QUDA build.\n"; exit(1);
+  }
+#endif
+
+  // Hasenbusch ratio levels (EO/Schur-preconditioned, clover-correct).
+  //   det(Schur(ladder[k]))^2 / det(Schur(ladder[k+1]))^2  via
+  //   TwoFlavourSchurCloverRatioAction(NumOp=heavy, DenOp=light, DS, AS) -- the
+  //   Schur-only ratio class (no ConstEE assumption, unlike Mike's
+  //   TwoFlavourEvenOddRatio.h, which crashes here for clover).  The EE
+  //   determinant is supplied separately by LightLogDet above (telescoping).
+  // Small Δm → well-conditioned → DP CG (CG_deriv/CG_action) suffices (as in the full-op driver).
+  // Three independent QUDA hooks, same QudaMGSchurSolver.h wrapper (2-solve gamma5 trick is agnostic
+  // to which inner solver QudaCloverInverter runs):
+  //   HASEN_MG_RUNG=<csv>        -- these rungs' Mpc(DenOp) solve via QUDA MULTIGRID, each with its
+  //                                 OWN full MG setup (chroma's SEPARATE-SubspaceID pattern, e.g. its
+  //                                 subspace_mg at -0.187 next to mg_subspace at the light masses).
+  //                                 Multi-rung = one setup's time+GPU memory PER rung: check memory
+  //                                 headroom at 48^3 before listing more than one.
+  //   HASEN_MG_SHARED_RUNGS=<csv> -- these rungs solve at their own mass with a GCR outer
+  //                                 PRECONDITIONED BY the MG setup of the lowest-index HASEN_MG_RUNG
+  //                                 rung (chroma's SHARED-SubspaceID pattern: one setup at the
+  //                                 lightest mass serves the ladder).  Zero extra setup/memory; the
+  //                                 mass mismatch only costs outer GCR iterations, growing with the
+  //                                 distance from the donor mass -- LastIter/LastSecs per rung locate
+  //                                 the crossover mass where plain QUDA-CG wins.  Requires
+  //                                 HASEN_MG_RUNG to include a lower-index rung (the donor).
+  //   HASEN_QUDA_CG_RUNGS=<csv>  -- these rungs' Mpc(DenOp) solve via plain QUDA CG (still GPU-side /
+  //                                 faster than Grid's CG, no MG preconditioner setup cost) -- useful
+  //                                 for the heavier, already-well-conditioned rungs where MG's extra
+  //                                 setup isn't worth it but QUDA's CG throughput still helps.
+  // A rung may only be routed one way; precedence when the same rung is listed more than once:
+  // HASEN_MG_RUNG > HASEN_MG_SHARED_RUNGS > HASEN_QUDA_CG_RUNGS.  All accept comma-separated lists.
+  int n_pf = n_ops - 1;
+  // Pure-Grid multigrid (HASEN_GRID_MG_RUNGS, parsed and built below): one hierarchy at the
+  // donor rung's mass and one GridMGSchurSolver per listed rung.  Declared HERE, at main()'s
+  // scope and before RatioPF, so they outlive the ratio actions that reference them and the
+  // integrator.  Both stay empty (nothing constructed) when HASEN_GRID_MG_RUNGS is unset.
+  std::unique_ptr<GridMGHierarchy> GridMGH;
+  std::vector<std::unique_ptr<GridMGSchurSolver>> GridMGRungSolver(n_pf);
+  // M3 (parsed and built after the Grid-MG block): the MG heatbath solvers (at NumOp's mass,
+  // sharing GridMGH, so declared after it) and the mixed-precision CG rung solvers, deriv/S and
+  // heatbath.  Same scope rule: before RatioPF, outside every #ifdef; empty when unset.
+  std::vector<std::unique_ptr<GridMGSchurSolver>> GridMGHeatbathSolver(n_pf);
+  std::vector<std::unique_ptr<MixedPrecCGRungSolver>> GridMixedRungSolver(n_pf);
+  std::vector<std::unique_ptr<MixedPrecCGRungSolver>> GridMixedHeatbathSolver(n_pf);
+  std::vector<std::unique_ptr<Action<LatticeGaugeField>>> RatioPF;
+#ifdef GRID_HAVE_QUDA
+  std::vector<std::unique_ptr<QudaRungSolverBase>> QudaRungSolver(n_pf);
+  // Parallel, INDEPENDENT solver vector for the heatbath (refresh()) step --
+  // built at NumOp's mass (ladder[k+1]), not DenOp's (ladder[k]), since
+  // refresh's normal-equation problem is M_1^dag M_1, not M_0's.  Only
+  // populated for rungs listed in HASEN_QUDA_CG_HEATBATH_RUNGS -- see
+  // TwoFlavourSchurCloverRatioActionQuda.h for why QudaCGSchurSolver (no
+  // extra code) is the right tool: it already solves exactly the
+  // M^dag M x = b, then apply M problem HeatbathSolver poses.
+  // Base-pointer (not QudaCGSchurSolver) so a rung's heatbath can be EITHER
+  // plain QUDA-CG (HASEN_QUDA_CG_HEATBATH_RUNGS) or shared-MG GCR off the
+  // deriv donor (HASEN_MG_HEATBATH_RUNGS).  Both satisfy the same
+  // (Mpc^dag Mpc)^-1 contract refresh() needs, and
+  // TwoFlavourSchurCloverRatioActionQuda already holds the heatbath behind a
+  // QudaRungSolverBase* (dynamic_cast in its ctor), so nothing downstream cares.
+  std::vector<std::unique_ptr<QudaRungSolverBase>> HeatbathQudaSolver(n_pf);
+#endif
+  auto parse_rung_list = [](const char *env) {
+    std::set<int> out;
+    if (const char *v = std::getenv(env); v && *v) {
+      std::stringstream ss(v);
+      std::string tok;
+      while (std::getline(ss, tok, ',')) if (!tok.empty()) out.insert(std::atoi(tok.c_str()));
+    }
+    return out;
+  };
+  std::set<int> mg_rungs      = parse_rung_list("HASEN_MG_RUNG");
+  std::set<int> mg_shared_rungs = parse_rung_list("HASEN_MG_SHARED_RUNGS");
+  std::set<int> quda_cg_rungs = parse_rung_list("HASEN_QUDA_CG_RUNGS");
+  std::set<int> quda_cg_heatbath_rungs = parse_rung_list("HASEN_QUDA_CG_HEATBATH_RUNGS");
+  // HASEN_MG_HEATBATH_RUNGS=<csv> -- route these rungs' heatbath (refresh())
+  // through shared-MG GCR at the NumOp mass (ladder[k+1]) instead of plain
+  // QUDA-CG, borrowing the SAME MG subspace the deriv donor already built.
+  // Rationale (measured on the base+G ladder, 3-sample FORCES_ONLY reference):
+  // the heatbath is 90.4 of 136 s per sample (66%), and PF0's refresh alone is
+  // 52.6 s vs its 9.4 s MG deriv -- refresh cost climbs steeply toward the
+  // critical mass (1.7 -> 52.6 s down the ladder) precisely because it is CG,
+  // while the MG deriv column stays flat (8-11 s).  The shared-MG constructor
+  // builds NO setup of its own, so on any rung where the deriv already runs MG
+  // the setup is already sunk and the marginal cost of this routing is ~zero.
+  // Takes precedence over HASEN_QUDA_CG_HEATBATH_RUNGS when a rung is in both.
+  // Needs an MG donor (HASEN_MG_RUNG) at a LOWER-OR-EQUAL index; falls back to
+  // CG with a warning if none exists by the time the rung is built.
+  // DEFAULT OFF -- unset reproduces the historical plain-CG heatbath exactly.
+  std::set<int> mg_heatbath_rungs = parse_rung_list("HASEN_MG_HEATBATH_RUNGS");
+  // HASEN_QUDA_FORCE_RUNGS=<csv|all> -- these rungs' force ASSEMBLY (the four
+  // hopping derivs + eight clover Cmunu derivs, the ~20 s/monomial floor at
+  // 48^3) runs on QUDA fused kernels (TwoFlavourSchurCloverRatioQudaForceAction,
+  // two Wilson+sigma calls per operator).  Orthogonal to the SOLVER routing
+  // above -- but v1 requires each listed rung to already be QUDA-routed, since
+  // the rung solver's SetGauge supplies the resident gauge the force calls use.
+  std::set<int> quda_force_rungs;
+  if (const char *v = std::getenv("HASEN_QUDA_FORCE_RUNGS"); v && *v) {
+    if (std::string(v) == "all") {
+      for (int k = 0; k < n_pf; ++k) quda_force_rungs.insert(k);
+    } else {
+      quda_force_rungs = parse_rung_list("HASEN_QUDA_FORCE_RUNGS");
+    }
+  }
+  // ── FORCES_ONLY: de-route skipped rungs, and promote the MG donor ───────────
+  // FORCES_SKIP_RUNGS omits whole ratio rungs from the FORCES_ONLY sweep.  Two
+  // consequences must be handled HERE, before any solver is constructed:
+  //  (1) A skipped rung needs no QUDA solver -- drop it from every routing list
+  //      so none is built, and so the "not QUDA-routed" guard below (which
+  //      exit(1)s under the common HASEN_QUDA_FORCE_RUNGS=all) never fires on it.
+  //  (2) The MG donor is the lowest-index own-MG rung and builds its subspace
+  //      LAZILY, on its own first solve.  A skipped donor therefore never builds
+  //      it and every sharee asserts on a null handle (QudaMGSchurSolver.h:114,
+  //      reproduced 2026-08-11 with FORCES_SKIP_RUNGS=0 + MG_SHARED_RUNGS=1,2).
+  //      Keeping the donor's solver object alive does NOT help -- only running
+  //      it does -- so promote the lowest-index SURVIVING MG-capable rung to
+  //      own-MG donor and re-point the remaining survivors at it.
+  if (std::getenv("FORCES_ONLY") != nullptr) {
+    std::set<int> fo_skip = parse_rung_list("FORCES_SKIP_RUNGS");
+    if (std::getenv("FORCES_SKIP_LIGHT") != nullptr)
+      for (int k = 0; k < n_pf; ++k) fo_skip.insert(k);
+    if (!fo_skip.empty()) {
+      const bool donor_skipped = !mg_rungs.empty() && fo_skip.count(*mg_rungs.begin());
+      std::set<int> mg_capable;   // survivors that asked for MG, own or shared
+      for (int k : mg_rungs)        if (!fo_skip.count(k)) mg_capable.insert(k);
+      for (int k : mg_shared_rungs) if (!fo_skip.count(k)) mg_capable.insert(k);
+      auto drop = [&](std::set<int> &s) { for (int k : fo_skip) s.erase(k); };
+      drop(mg_rungs); drop(mg_shared_rungs); drop(quda_cg_rungs);
+      drop(quda_cg_heatbath_rungs); drop(quda_force_rungs); drop(mg_heatbath_rungs);
+      if (donor_skipped && !mg_capable.empty()) {
+        const int new_donor = *mg_capable.begin();
+        mg_rungs.clear();
+        mg_rungs.insert(new_donor);
+        mg_shared_rungs = mg_capable;
+        mg_shared_rungs.erase(new_donor);
+        std::cout << GridLogMessage
+                  << "[FORCES_ONLY] MG donor rung was skipped -- promoted rung "
+                  << new_donor << " to own-MG donor (sharees:";
+        for (int k : mg_shared_rungs) std::cout << " " << k;
+        std::cout << " )" << std::endl;
+      }
+      std::cout << GridLogMessage << "[FORCES_ONLY] de-routed skipped rungs:";
+      for (int k : fo_skip) std::cout << " " << k;
+      std::cout << std::endl;
+    }
+  }
+  // ── HASEN_GRID_MG_RUNGS: pure-Grid multigrid rung solver (no QUDA) ─────────
+  // HASEN_GRID_MG_RUNGS=<csv> -- these rungs' DerivativeSolver AND ActionSolver (both solve
+  //   Mpc(DenOp) at ladder[k]; one GridMGSchurSolver per rung fills both slots, at cg_tol_drv,
+  //   as the QUDA hybrid does) run a fresh fp64 flexible GCR on the action's own operator,
+  //   preconditioned by ONE fp32 three-level multigrid (the gq-mg GMG3 recipe = best2 with a
+  //   4-step fine post-smoother, src/grid_mg/, tunables GRID_MG_* in grid_mg_params.h; M2 ran
+  //   best2, GRID_MG_SMOOTHER_NSTEP=8 restores it).  The hierarchy sits on LightOpsF[k0], k0 = the
+  //   LOWEST listed rung (the donor), and is built lazily at the donor's first solve; every
+  //   other listed rung shares it unchanged (GCR at its own mass, donor's hierarchy).  Only the
+  //   donor imports the gauge into it (GridMGSchurSolver::SetGauge), which is exact because the
+  //   donor's monomial is pushed -- hence refreshed, evaluated and differentiated -- before
+  //   every higher-index rung's, on the same gauge field.  The heatbath stays CG_action unless
+  //   HASEN_GRID_MG_HEATBATH_RUNGS routes it here too (M3 block below).
+  //   Mutually exclusive with every QUDA rung route.  Unset or empty = nothing here runs: no
+  //   hierarchy, no solver, no output.  Spec: __docs/2026_09_29_pure_grid_m2_mg_solver_design.md
+  //   section 3.
+  const char *grid_mg_env = std::getenv("HASEN_GRID_MG_RUNGS");
+  const bool grid_mg_on = grid_mg_env && *grid_mg_env;
+  std::set<int> grid_mg_rungs;       // routed to Grid-MG (after FORCES_ONLY de-routing)
+  std::set<int> grid_mg_fo_skipped;  // listed, but dropped by a FORCES_ONLY skip
+  int grid_mg_donor = -1;
+  if (grid_mg_on) {
+    for (const char *q : {"HASEN_MG_RUNG", "HASEN_MG_SHARED_RUNGS", "HASEN_QUDA_CG_RUNGS",
+                          "HASEN_MG_HEATBATH_RUNGS", "HASEN_QUDA_CG_HEATBATH_RUNGS"}) {
+      if (const char *v = std::getenv(q); v && *v) {
+        std::cerr << "HASEN_GRID_MG_RUNGS=" << grid_mg_env << " and " << q << "=" << v
+                  << " are both set: a rung has ONE solver route (pure-Grid MG or QUDA). "
+                     "Unset one of them.\n";
+        exit(1);
+      }
+    }
+    // Strict parse: a typo must not silently become rung 0 (atoi would make it so).
+    std::stringstream ss(grid_mg_env);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+      if (tok.empty()) continue;
+      char *end = nullptr;
+      const long k = std::strtol(tok.c_str(), &end, 10);
+      if (end == tok.c_str() || *end != '\0') {
+        std::cerr << "HASEN_GRID_MG_RUNGS=" << grid_mg_env << ": '" << tok
+                  << "' is not a rung index.\n";
+        exit(1);
+      }
+      if (k < 0 || k >= n_pf) {  // only ratio rungs; the tail is not routable
+        std::cerr << "HASEN_GRID_MG_RUNGS=" << grid_mg_env << ": rung " << k
+                  << " is not a ratio rung (need 0 <= k < " << n_pf << ", the ladder's "
+                  << n_pf << " ratio rungs).\n";
+        exit(1);
+      }
+      grid_mg_rungs.insert((int)k);
+    }
+    if (grid_mg_rungs.empty()) {
+      std::cerr << "HASEN_GRID_MG_RUNGS=" << grid_mg_env << " lists no rung.\n";
+      exit(1);
+    }
+    // FORCES_ONLY: a skipped rung never solves, so it must not be the donor (the hierarchy
+    // imports its gauge only through the donor): drop skipped rungs, as the QUDA lists above
+    // are de-routed, and the lowest SURVIVING listed rung becomes the donor.
+    if (std::getenv("FORCES_ONLY") != nullptr) {
+      std::set<int> fo_skip = parse_rung_list("FORCES_SKIP_RUNGS");
+      if (std::getenv("FORCES_SKIP_LIGHT") != nullptr)
+        for (int k = 0; k < n_pf; ++k) fo_skip.insert(k);
+      for (int k : fo_skip)
+        if (grid_mg_rungs.erase(k)) grid_mg_fo_skipped.insert(k);
+      if (!grid_mg_fo_skipped.empty()) {
+        std::cout << GridLogMessage << "[FORCES_ONLY] Grid-MG: de-routed skipped rungs:";
+        for (int k : grid_mg_fo_skipped) std::cout << " " << k;
+        std::cout << " (donor = lowest surviving listed rung)" << std::endl;
+      }
+    }
+    if (!grid_mg_rungs.empty()) {
+      const int k0 = *grid_mg_rungs.begin();
+      grid_mg_donor = k0;
+      GridMGH = std::make_unique<GridMGHierarchy>(*LightOpsF[k0], &GridF, &RBGridF, Odd,
+                                                  GridMGParams::from_env(),
+                                                  "PF" + std::to_string(k0) + " hierarchy");
+      for (int k : grid_mg_rungs) {
+        if (k < k0)  // cannot happen: k0 is the set's minimum
+          std::cout << GridLogMessage << "[Ladder] NOTE: Grid-MG rung " << k
+                    << " is below the donor rung " << k0
+                    << ": it would solve before the donor imports the gauge" << std::endl;
+        GridMGRungSolver[k] = std::make_unique<GridMGSchurSolver>(
+            *GridMGH, cg_tol_drv, Odd, "PF" + std::to_string(k), k == k0);
+      }
+      std::cout << GridLogMessage << "[Ladder] Grid-MG hierarchy: donor rung " << k0
+                << " mass=" << ladder[k0] << " cb=Odd fp32, outer fp64 FGCR tol=" << cg_tol_drv
+                << " | " << GridMGH->Params().Summary() << std::endl;
+    } else {
+      std::cout << GridLogMessage << "[Ladder] Grid-MG: every listed rung is skipped by "
+                                     "FORCES_ONLY; no hierarchy built" << std::endl;
+    }
+  }
+  // ── M3: Grid-MG heatbath + mixed-precision CG rung solvers (no QUDA) ────────
+  // HASEN_GRID_MG_HEATBATH_RUNGS=<csv> -- these rungs' HeatbathSolver (refresh() solves
+  //   (Vpc^dag Vpc)^-1 with Vpc = Schur(NumOp), mass ladder[k+1], on *LightOps[k+1]) is a
+  //   GridMGSchurSolver on the SAME hierarchy (GCR at ladder[k+1], donor's preconditioner),
+  //   tol cg_tol_act (CG_action's), non-donor.  Every listed rung must be in
+  //   HASEN_GRID_MG_RUNGS.
+  //   Refresh order (ratio_action_rung_solver.h): the wrapper's refresh() calls
+  //   solver_.SetGauge(U) (the rung's deriv/S solver), then the heatbath solver's SetGauge(U)
+  //   (via its dynamic_cast), then Base::refresh, whose ImportGauge(NumOp/DenOp) precedes its
+  //   single solve, the heatbath's.  So on the DONOR rung the donor's import of U always comes
+  //   first.  On a SHARING rung it comes first only if the donor's monomial was refreshed
+  //   earlier in the same sweep: true when both sit on one integrator level (the rungs are
+  //   pushed in index order and Integrator::refresh walks levels, then actions, in order) and
+  //   in FORCES_ONLY (PF0, PF1, ... in order); FALSE when HASEN_STRANGE_RUNGS puts the donor on
+  //   the strange level and the sharer on light (light refreshes first: stale preconditioner,
+  //   and at the first trajectory no gauge at all, Build() asserts).  So the heatbath solvers
+  //   do not rely on order: ImportIfHierarchyStale() makes their SetGauge import U into the
+  //   hierarchy unless its current generation already carries U (GridMGHierarchy::
+  //   SetGaugeIfNew: a fingerprint of U and of the fp32 links, tagged by generation).  In the
+  //   same-level case that is two reductions and no import.
+  // HASEN_GRID_MIXED_CG_RUNGS=<csv> -- these rungs' DerivativeSolver AND ActionSolver are one
+  //   MixedPrecCGRungSolver (fp32 inner CG on *LightOpsF[k], fp64 defect correction on
+  //   *LightOps[k], max_inner cg_max, max_outer 50 = the tail's CG_light_md).  ONE object fills
+  //   both slots (TwoFlavourSchurCloverRatioActionRungSolver), so S is solved at cg_tol_drv,
+  //   not cg_tol_act: the hybrid's (and the Grid-MG route's) convention.  No rung may also be in
+  //   HASEN_GRID_MG_RUNGS.
+  // HASEN_GRID_MIXED_CG_HEATBATH_RUNGS=<csv> -- these rungs' HeatbathSolver is a
+  //   MixedPrecCGRungSolver on (*LightOps[k+1], *LightOpsF[k+1]) at cg_tol_act.  No rung may
+  //   also be in HASEN_GRID_MG_HEATBATH_RUNGS.  Any deriv route may pair with it: Grid-MG,
+  //   mixed CG, or plain CG (then TwoFlavourSchurCloverRatioActionHeatbathRung keeps CG_deriv /
+  //   CG_action for deriv / S and only syncs the heatbath's fp32 gauge in refresh).
+  //   The fp32 operators are shared (LightOpsF[k+1] also serves rung k+1's deriv solver, the
+  //   tail's MP deriv for the last rung, the hierarchy for the donor); MixedPrecCGRungSolver
+  //   keys its skip-redundant-import test to the operator, see mixed_cg_rung_solver.h.
+  // All three: strict parse (as HASEN_GRID_MG_RUNGS), ratio rungs only, mutually exclusive with
+  // every QUDA rung route; unset or empty = nothing here runs and nothing is printed.
+  auto parse_grid_rung_list = [n_pf](const char *name) {
+    std::set<int> out;
+    const char *v = std::getenv(name);
+    if (!v || !*v) return out;
+    std::stringstream ss(v);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+      if (tok.empty()) continue;
+      char *end = nullptr;
+      const long k = std::strtol(tok.c_str(), &end, 10);
+      if (end == tok.c_str() || *end != '\0') {
+        std::cerr << name << "=" << v << ": '" << tok << "' is not a rung index.\n";
+        exit(1);
+      }
+      if (k < 0 || k >= n_pf) {  // only ratio rungs; the tail is not routable
+        std::cerr << name << "=" << v << ": rung " << k << " is not a ratio rung (need 0 <= k < "
+                  << n_pf << ", the ladder's " << n_pf << " ratio rungs).\n";
+        exit(1);
+      }
+      out.insert((int)k);
+    }
+    if (out.empty()) {
+      std::cerr << name << "=" << v << " lists no rung.\n";
+      exit(1);
+    }
+    return out;
+  };
+  std::set<int> grid_mg_hb_rungs = parse_grid_rung_list("HASEN_GRID_MG_HEATBATH_RUNGS");
+  const std::set<int> grid_mixed_rungs = parse_grid_rung_list("HASEN_GRID_MIXED_CG_RUNGS");
+  const std::set<int> grid_mixed_hb_rungs =
+      parse_grid_rung_list("HASEN_GRID_MIXED_CG_HEATBATH_RUNGS");
+  const bool grid_m3_on =
+      !grid_mg_hb_rungs.empty() || !grid_mixed_rungs.empty() || !grid_mixed_hb_rungs.empty();
+  if (grid_m3_on) {
+    for (const char *g : {"HASEN_GRID_MG_HEATBATH_RUNGS", "HASEN_GRID_MIXED_CG_RUNGS",
+                          "HASEN_GRID_MIXED_CG_HEATBATH_RUNGS"}) {
+      const char *gv = std::getenv(g);
+      if (!gv || !*gv) continue;
+      for (const char *q : {"HASEN_MG_RUNG", "HASEN_MG_SHARED_RUNGS", "HASEN_QUDA_CG_RUNGS",
+                            "HASEN_MG_HEATBATH_RUNGS", "HASEN_QUDA_CG_HEATBATH_RUNGS"}) {
+        if (const char *v = std::getenv(q); v && *v) {
+          std::cerr << g << "=" << gv << " and " << q << "=" << v
+                    << " are both set: a rung has ONE solver route (pure Grid or QUDA). "
+                       "Unset one of them.\n";
+          exit(1);
+        }
+      }
+    }
+    // Validation against the LISTED Grid-MG rungs (before any FORCES_ONLY de-routing).
+    std::set<int> grid_mg_listed = grid_mg_rungs;
+    grid_mg_listed.insert(grid_mg_fo_skipped.begin(), grid_mg_fo_skipped.end());
+    for (int k : grid_mg_hb_rungs)
+      if (!grid_mg_listed.count(k)) {
+        std::cerr << "HASEN_GRID_MG_HEATBATH_RUNGS=" << std::getenv("HASEN_GRID_MG_HEATBATH_RUNGS")
+                  << ": rung " << k << " is not in HASEN_GRID_MG_RUNGS="
+                  << (grid_mg_on ? grid_mg_env : "(unset)")
+                  << ". The Grid-MG heatbath runs on the hierarchy of the Grid-MG rungs; list "
+                     "the rung there too, or use HASEN_GRID_MIXED_CG_HEATBATH_RUNGS.\n";
+        exit(1);
+      }
+    for (int k : grid_mixed_rungs)
+      if (grid_mg_listed.count(k)) {
+        std::cerr << "HASEN_GRID_MIXED_CG_RUNGS=" << std::getenv("HASEN_GRID_MIXED_CG_RUNGS")
+                  << ": rung " << k << " is also in HASEN_GRID_MG_RUNGS=" << grid_mg_env
+                  << ": its deriv/action solves have ONE route. Unset one of them.\n";
+        exit(1);
+      }
+    for (int k : grid_mixed_hb_rungs)
+      if (grid_mg_hb_rungs.count(k)) {
+        std::cerr << "HASEN_GRID_MIXED_CG_HEATBATH_RUNGS="
+                  << std::getenv("HASEN_GRID_MIXED_CG_HEATBATH_RUNGS") << ": rung " << k
+                  << " is also in HASEN_GRID_MG_HEATBATH_RUNGS="
+                  << std::getenv("HASEN_GRID_MG_HEATBATH_RUNGS")
+                  << ": its heatbath has ONE route. Unset one of them.\n";
+        exit(1);
+      }
+    // FORCES_ONLY: a Grid-MG heatbath needs its rung's Grid-MG route (and the hierarchy); a
+    // rung the skip de-routed above never refreshes, so drop it here as well.
+    std::set<int> grid_mg_hb_fo_skipped;
+    for (int k : grid_mg_fo_skipped)
+      if (grid_mg_hb_rungs.erase(k)) grid_mg_hb_fo_skipped.insert(k);
+    if (!grid_mg_hb_fo_skipped.empty()) {
+      std::cout << GridLogMessage << "[FORCES_ONLY] Grid-MG heatbath: de-routed skipped rungs:";
+      for (int k : grid_mg_hb_fo_skipped) std::cout << " " << k;
+      std::cout << std::endl;
+    }
+    for (int k : grid_mg_hb_rungs) {
+      GRID_ASSERT(GridMGH && grid_mg_rungs.count(k));
+      GridMGHeatbathSolver[k] = std::make_unique<GridMGSchurSolver>(
+          *GridMGH, cg_tol_act, Odd, "PF" + std::to_string(k) + " heatbath", /*donor=*/false);
+      GridMGHeatbathSolver[k]->ImportIfHierarchyStale();
+    }
+    for (int k : grid_mixed_rungs)
+      GridMixedRungSolver[k] = std::make_unique<MixedPrecCGRungSolver>(
+          *LightOps[k], *LightOpsF[k], &RBGridF, cg_tol_drv, cg_max, 50,
+          "PF" + std::to_string(k) + " deriv/S");
+    for (int k : grid_mixed_hb_rungs)
+      GridMixedHeatbathSolver[k] = std::make_unique<MixedPrecCGRungSolver>(
+          *LightOps[k + 1], *LightOpsF[k + 1], &RBGridF, cg_tol_act, cg_max, 50,
+          "PF" + std::to_string(k) + " heatbath");
+  }
+#ifdef GRID_HAVE_QUDA
+  // Donor for HASEN_MG_SHARED_RUNGS = the lowest-index own-MG rung, set when
+  // its solver is constructed below (loop runs k ascending, so the donor
+  // exists before any higher-index sharee is built).
+  QudaMGSchurSolver *mg_donor = nullptr;
+#endif
+  for (int k = 0; k < n_pf; ++k) {
+    bool want_mg = mg_rungs.count(k);
+    bool want_mg_shared = !want_mg && mg_shared_rungs.count(k);
+    bool want_quda_cg = !want_mg && !want_mg_shared && quda_cg_rungs.count(k);
+    if (want_mg || want_mg_shared || want_quda_cg) {
+#ifdef GRID_HAVE_QUDA
+      QudaCloverParams qp_mg;
+      qp_mg.mass = ladder[k];  // DenOp mass -- the rung being QUDA-accelerated
+      qp_mg.csw  = csw;
+      qp_mg.anti_periodic_t = true;
+      qp_mg.tol = cg_tol_drv;
+      qp_mg.max_iter = cg_max;
+      qp_mg.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+      qp_mg.use_multigrid = want_mg;
+      // Diagnostic: QudaCloverParams defaults cuda_prec_sloppy=SINGLE (mixed-
+      // precision inner iterations). QUDA_SLOPPY_DOUBLE=1 forces pure double
+      // precision throughout, to test whether a plain-CG rung's force
+      // discrepancy vs Grid-CG (seen at 48^3, NOT at 16^3) is caused by
+      // single-precision roundoff accumulating over the many (~1000s at 48^3
+      // near-critical rungs) CG iterations needed to hit a fixed residual
+      // tolerance -- MG needs far fewer iterations for the same tolerance, so
+      // if this hypothesis is right, only plain CG should be sensitive to it.
+      if (std::getenv("QUDA_SLOPPY_DOUBLE") != nullptr) {
+        qp_mg.cuda_prec_sloppy = QUDA_DOUBLE_PRECISION;
+      }
+      // 48^3 antiperiodic-t: the boundary time links carry the baked-in -1
+      // (det=-1); RECONSTRUCT_12 (the default) mis-rebuilds them, assuming
+      // det=+1. Same fix as the strange/light paths in
+      // gen_qcd_hasenbusch_tune_compact.cc (QUDA_FORCE_RECON_NO), ported here
+      // because compact_schur's plain QUDA-CG rungs never had it -- 16^3 is
+      // well-conditioned enough to tolerate the mis-reconstruction, 48^3 is not.
+      if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr) {
+        qp_mg.recon_sloppy = QUDA_RECONSTRUCT_NO;
+      }
+      if (want_mg) {
+        // Same HMC_MG_* knobs as the existing USE_HMC_MG single-mass path
+        // (TwoFlavourSchurCloverQudaForceActionMP.h) -- reused verbatim.
+        const char *nlv = std::getenv("HMC_MG_NLEVEL");
+        qp_mg.mg.n_level = nlv ? std::atoi(nlv) : 2;
+        auto parse_block = [](const char *s, std::array<int,4> dflt) {
+          if (!s || !*s) return dflt;
+          std::array<int,4> b = dflt;
+          std::sscanf(s, "%d %d %d %d", &b[0], &b[1], &b[2], &b[3]);
+          return b;
+        };
+        std::array<int,4> b0 = parse_block(std::getenv("HMC_MG_BLOCK_L0"), {4,4,4,4});
+        std::array<int,4> b1 = parse_block(std::getenv("HMC_MG_BLOCK_L1"), {2,2,2,2});
+        qp_mg.mg.geo_block_size = (qp_mg.mg.n_level >= 3)
+            ? std::vector<std::array<int,4>>{b0, b1}
+            : std::vector<std::array<int,4>>{b0};
+        if (const char *nv = std::getenv("HMC_MG_NVEC")) {
+          int a=0,b=0,c=0; int n = std::sscanf(nv, "%d %d %d", &a,&b,&c);
+          std::vector<int> v; if(n>=1)v.push_back(a); if(n>=2)v.push_back(b); if(n>=3)v.push_back(c);
+          if (!v.empty()) { qp_mg.mg.n_vec_levels = v; qp_mg.mg.n_vec = v[0]; }
+        }
+        if (const char *cm = std::getenv("HMC_MG_COARSE_MAXITER"))
+          qp_mg.mg.coarse_solver_maxiter = std::atoi(cm);
+        if (const char *r = std::getenv("HMC_MG_REFRESH"))
+          qp_mg.mg.setup_maxiter_refresh = std::atoi(r);
+        if (const char *r = std::getenv("HMC_MG_REBUILD_EVERY"))
+          qp_mg.mg.rebuild_every = std::atoi(r);
+        // HMC_MG_REFRESH_EVERY / HMC_MG_THRESHOLD_COUNT / HMC_MG_RSD_TOL_FACTOR
+        applyHmcMgCadenceEnv(qp_mg.mg);
+      }
+      if (want_mg) {
+        auto s = std::make_unique<QudaMGSchurSolver>(LightOps[k]->GaugeGrid(), qp_mg, Odd);
+        if (mg_donor == nullptr) mg_donor = s.get();  // lowest-index own-MG rung donates
+        QudaRungSolver[k] = std::move(s);
+      } else if (want_mg_shared) {
+        // GCR at THIS rung's mass, preconditioned by the donor's MG setup
+        // (qp_mg.use_multigrid is false here, so no second setup is built).
+        if (mg_donor == nullptr) {
+          std::cerr << "HASEN_MG_SHARED_RUNGS=" << k
+                    << " needs a lower-index rung in HASEN_MG_RUNG (the MG donor).\n";
+          exit(1);
+        }
+        QudaRungSolver[k] = std::make_unique<QudaMGSchurSolver>(
+            LightOps[k]->GaugeGrid(), qp_mg, Odd, mg_donor);
+      } else {
+        // Plain QUDA-CG: QudaMGSchurSolver's zero-pad/gamma5 trick was only
+        // ever validated for use_multigrid=true (MG's QUDA_DIRECT_SOLVE,
+        // where matpc_type is irrelevant). Its inner QudaCloverInverter
+        // hardcodes matpc_type=EVEN_EVEN, which is the WRONG parity/form for
+        // our Odd-checkerboard asymmetric Schur system under CG's
+        // QUDA_NORMOP_PC_SOLVE -- see QudaCGSchurSolver.h for the fix
+        // (direct half-volume solve, ODD_ODD_ASYMMETRIC, same convention
+        // already proven in OneFlavourSchurCloverQudaRationalActionMP.h).
+        QudaRungSolver[k] = std::make_unique<QudaCGSchurSolver>(LightOps[k]->GaugeGrid(), qp_mg, Odd);
+      }
+      // Heatbath (refresh()) acceleration is INDEPENDENT of the deriv/action
+      // choice above -- separate env var, separate solver instance, built at
+      // NumOp's mass (ladder[k+1]).  Only offered on rungs that already have
+      // a QUDA deriv/action solver (this loop branch) -- no infrastructure
+      // exists yet to attach a QUDA heatbath solver to a plain-Grid-CG rung.
+      OperatorFunction<LatticeFermion> *heatbath_solver_ptr = &CG_action;
+      // HASEN_MG_HEATBATH_RUNGS wins over HASEN_QUDA_CG_HEATBATH_RUNGS, but
+      // only if a donor actually exists by now (the donor is set when the
+      // lowest own-MG rung's solver is built, above, and this loop ascends).
+      bool want_mg_hb = mg_heatbath_rungs.count(k) != 0;
+      if (want_mg_hb && mg_donor == nullptr) {
+        std::cout << GridLogWarning << "[Ladder] rung " << k
+                  << " requested HASEN_MG_HEATBATH_RUNGS but no MG donor exists yet"
+                     " (HASEN_MG_RUNG must name a lower-or-equal rung) -- falling back"
+                     " to the plain QUDA-CG heatbath" << std::endl;
+        want_mg_hb = false;
+      }
+      if (want_mg_hb || quda_cg_heatbath_rungs.count(k)) {
+        QudaCloverParams qp_hb;
+        qp_hb.mass = ladder[k+1];  // NumOp mass -- refresh solves M_1^dag M_1
+        qp_hb.csw  = csw;
+        qp_hb.anti_periodic_t = true;
+        qp_hb.tol = cg_tol_act;  // heatbath sets phi for the whole trajectory -- match CG_action's tol
+        qp_hb.max_iter = cg_max;
+        qp_hb.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+        // false in BOTH branches: the shared-MG ctor asserts on it, because a
+        // sharee borrows the donor's setup rather than building its own.
+        qp_hb.use_multigrid = false;
+        if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+          qp_hb.recon_sloppy = QUDA_RECONSTRUCT_NO;
+        if (want_mg_hb) {
+          // GCR at ladder[k+1], preconditioned by the donor's subspace at
+          // ladder[donor].  Note ladder[k+1] is EXACTLY rung k+1's deriv mass,
+          // so for every rung but the last this is a mass the shared-MG path is
+          // already proven to solve well in the deriv column.
+          HeatbathQudaSolver[k] = std::make_unique<QudaMGSchurSolver>(
+              LightOps[k+1]->GaugeGrid(), qp_hb, Odd, mg_donor);
+        } else {
+          HeatbathQudaSolver[k] = std::make_unique<QudaCGSchurSolver>(
+              LightOps[k+1]->GaugeGrid(), qp_hb, Odd);
+        }
+        heatbath_solver_ptr = HeatbathQudaSolver[k].get();
+        std::cout << GridLogMessage << "[Ladder] rung " << k
+                  << " HeatbathSolver = "
+                  << (want_mg_hb ? "QUDA MG-shared (GCR at own mass, donor's setup)"
+                                 : "QUDA CG")
+                  << ", mass=" << ladder[k+1] << std::endl;
+      }
+      if (quda_force_rungs.count(k)) {
+        // Force-assembly Path B: same solver wiring, deriv assembly on QUDA.
+        // qp_den = the rung's params (DenOp mass, already in qp_mg); qp_num =
+        // copy at NumOp's mass.  Both are parameter sources only (never
+        // solved/SetGauge'd) -- use_multigrid forced off inside the class.
+        QudaCloverParams qp_num = qp_mg;
+        qp_num.mass = ladder[k+1];
+        RatioPF.emplace_back(std::make_unique<TwoFlavourSchurCloverRatioQudaForceAction<WilsonImplR, WCF>>(
+            *LightOps[k+1], *LightOps[k], *QudaRungSolver[k], *heatbath_solver_ptr,
+            qp_mg, qp_num));
+        std::cout << GridLogMessage << "[Ladder] rung " << k
+                  << " FORCE ASSEMBLY = QUDA kernels (Wilson+sigma)" << std::endl;
+      } else {
+        RatioPF.emplace_back(std::make_unique<TwoFlavourSchurCloverRatioActionQuda<WilsonImplR, WCF>>(
+            *LightOps[k+1], *LightOps[k], *QudaRungSolver[k], *heatbath_solver_ptr));
+      }
+      std::cout << GridLogMessage << "[Ladder] rung " << k
+                << " DerivativeSolver/ActionSolver = "
+                << (want_mg ? ("QUDA MG (" + std::to_string(qp_mg.mg.n_level) + " levels)")
+                    : want_mg_shared ? std::string("QUDA MG-shared (GCR at own mass, donor's setup)")
+                    : std::string("QUDA CG"))
+                << ", mass=" << ladder[k] << std::endl;
+#else
+      std::cerr << "HASEN_MG_RUNG/HASEN_QUDA_CG_RUNGS require a QUDA build.\n"; exit(1);
+#endif
+    } else {
+      if (quda_force_rungs.count(k)) {
+        std::cerr << "HASEN_QUDA_FORCE_RUNGS includes rung " << k
+                  << " but that rung is not QUDA-routed -- add it to HASEN_MG_RUNG / "
+                     "HASEN_MG_SHARED_RUNGS / HASEN_QUDA_CG_RUNGS first (v1 requires "
+                     "a QUDA rung solver for gauge residency).\n";
+        exit(1);
+      }
+      // M3 routes (HASEN_GRID_MG_HEATBATH_RUNGS, HASEN_GRID_MIXED_CG_*): all null when unset.
+      RungSolverBase *ds_rung =
+          GridMGRungSolver[k] ? static_cast<RungSolverBase *>(GridMGRungSolver[k].get())
+                              : static_cast<RungSolverBase *>(GridMixedRungSolver[k].get());
+      RungSolverBase *hb_rung =
+          GridMGHeatbathSolver[k]
+              ? static_cast<RungSolverBase *>(GridMGHeatbathSolver[k].get())
+              : static_cast<RungSolverBase *>(GridMixedHeatbathSolver[k].get());
+      OperatorFunction<LatticeFermion> &hb_solver =
+          hb_rung ? static_cast<OperatorFunction<LatticeFermion> &>(*hb_rung)
+                  : static_cast<OperatorFunction<LatticeFermion> &>(CG_action);
+      if (ds_rung) {
+        // HASEN_GRID_MG_RUNGS / HASEN_GRID_MIXED_CG_RUNGS: one rung solver for deriv + S
+        // (Mpc(DenOp)); heatbath = the M3 heatbath solver if listed, else plain CG_action.
+        RatioPF.emplace_back(
+            std::make_unique<TwoFlavourSchurCloverRatioActionRungSolver<WilsonImplR, WCF>>(
+                *LightOps[k+1],  // NumOp = heavier mass
+                *LightOps[k],    // DenOp = lighter mass
+                *ds_rung, hb_solver));
+      } else if (hb_rung) {
+        // Plain CG deriv / S (CG_deriv / CG_action, as the default), M3 heatbath solver.
+        RatioPF.emplace_back(
+            std::make_unique<TwoFlavourSchurCloverRatioActionHeatbathRung<WilsonImplR, WCF>>(
+                *LightOps[k+1],  // NumOp = heavier mass
+                *LightOps[k],    // DenOp = lighter mass
+                CG_deriv, CG_action, *hb_rung));
+      } else {
+        RatioPF.emplace_back(
+            std::make_unique<TwoFlavourSchurCloverRatioAction<WilsonImplR, WCF>>(
+                *LightOps[k+1],  // NumOp = heavier mass
+                *LightOps[k],    // DenOp = lighter mass
+                CG_deriv, CG_action));
+      }
+      if (grid_mg_on || grid_m3_on) {
+        std::ostringstream ds, hb;
+        ds.precision(std::cout.precision());
+        hb.precision(std::cout.precision());
+        if (GridMixedRungSolver[k])
+          ds << "Grid mixed-precision CG (fp32 inner CG, fp64 defect correction; ONE solver "
+                "for deriv AND S at cg_tol_drv=" << cg_tol_drv << ", as the hybrid)";
+        else if (!GridMGRungSolver[k])
+          ds << (grid_mg_fo_skipped.count(k) ? "Grid-CG (Grid-MG de-routed: FORCES_ONLY skip)"
+                                             : "Grid-CG");
+        else if (k == grid_mg_donor)
+          ds << "Grid-MG donor (builds the fp32 hierarchy at this mass)";
+        else
+          ds << "Grid-MG shared (GCR at own mass, rung " << grid_mg_donor << "'s hierarchy)";
+        if (GridMGHeatbathSolver[k])
+          hb << "Grid-MG shared (GCR at mass " << ladder[k+1] << ", rung " << grid_mg_donor
+             << "'s hierarchy, tol " << cg_tol_act
+             << ", imports the gauge if the hierarchy lacks it)";
+        else if (GridMixedHeatbathSolver[k])
+          hb << "Grid mixed-precision CG (fp32 inner CG, mass " << ladder[k+1] << ", tol "
+             << cg_tol_act << ")";
+        else
+          hb << "Grid CG";
+        std::cout << GridLogMessage << "[Ladder] rung " << k
+                  << " DerivativeSolver/ActionSolver = " << ds.str()
+                  << ", HeatbathSolver = " << hb.str() << ", mass=" << ladder[k] << std::endl;
+      }
+    }
+    RatioPF.back()->is_smeared = true;
+  }
+  std::cout << GridLogMessage << "Built " << n_pf << " Schur ratio PF levels." << std::endl;
+
+  // Schur tail: det(Schur(ladder.back()))^2 as a single EO-Schur monomial, capping the chain.
+  // Default = mixed-precision Grid MD force (SP inner + DP reliable), mirroring the 2+1
+  // driver's LightSchurPF.  HASEN_QUDA_CG_TAIL=1 swaps both tail solves (deriv at
+  // cg_tol_drv, action at cg_tol_act) to plain QUDA CG — the same QudaCGSchurSolver the
+  // ratio rungs use.  The tail heatbath is an application (phi = Mpc^dag eta, no solve),
+  // so it has no QUDA variant and stays identical across the two paths.
+  int itail = n_ops - 1;
+  SchurDifferentiableOperator<WilsonImplR> LightTailSchurD(*LightOps[itail]);
+  SchurDifferentiableOperator<WilsonImplF> LightTailSchurF(*LightOpsF[itail]);
+  MixedPrecCGWrapper<LatticeFermion, LatticeFermionF,
+                     SchurDifferentiableOperator<WilsonImplR>,
+                     SchurDifferentiableOperator<WilsonImplF>>
+      CG_light_md(cg_tol_drv, cg_max, 50, &RBGridF, LightTailSchurD, LightTailSchurF);
+  std::unique_ptr<TwoFlavourSchurCloverActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>
+      TailGrid;
+#ifdef GRID_HAVE_QUDA
+  std::unique_ptr<QudaCGSchurSolver> TailQudaDrvSolver, TailQudaActSolver;
+  std::unique_ptr<TwoFlavourSchurCloverActionQudaTail<WilsonImplR, WCF>> TailQuda;
+  std::unique_ptr<TwoFlavourSchurCloverQudaForceTailAction<WilsonImplR, WCF>> TailQudaForce;
+#endif
+  Action<LatticeGaugeField> *LightTailSchur = nullptr;
+  if (std::getenv("HASEN_QUDA_CG_TAIL") != nullptr) {
+#ifdef GRID_HAVE_QUDA
+    QudaCloverParams qp_tail;
+    qp_tail.mass = ladder[itail];
+    qp_tail.csw  = csw;
+    qp_tail.anti_periodic_t = true;
+    qp_tail.tol = cg_tol_drv;
+    qp_tail.max_iter = cg_max;
+    qp_tail.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+    qp_tail.use_multigrid = false;
+    if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+      qp_tail.recon_sloppy = QUDA_RECONSTRUCT_NO;
+    TailQudaDrvSolver = std::make_unique<QudaCGSchurSolver>(
+        LightOps[itail]->GaugeGrid(), qp_tail, Odd);
+    qp_tail.tol = cg_tol_act;  // S() feeds the Metropolis test — match CG_action's tol
+    TailQudaActSolver = std::make_unique<QudaCGSchurSolver>(
+        LightOps[itail]->GaugeGrid(), qp_tail, Odd);
+    if (std::getenv("HASEN_QUDA_FORCE_TAIL") != nullptr) {
+      // Force-assembly Path B for the tail: same QUDA-CG solvers, deriv
+      // assembly on QUDA fused kernels.  qp_tf is a parameter source only
+      // (tol/multigrid unused by the force calls).
+      QudaCloverParams qp_tf = qp_tail;
+      qp_tf.tol = cg_tol_drv;
+      TailQudaForce = std::make_unique<TwoFlavourSchurCloverQudaForceTailAction<WilsonImplR, WCF>>(
+          *LightOps[itail], *TailQudaDrvSolver, *TailQudaActSolver, qp_tf);
+      TailQudaForce->is_smeared = true;
+      LightTailSchur = TailQudaForce.get();
+      std::cout << GridLogMessage
+                << "[Ladder] tail FORCE ASSEMBLY = QUDA kernels (Wilson+sigma)"
+                << std::endl;
+    } else {
+      TailQuda = std::make_unique<TwoFlavourSchurCloverActionQudaTail<WilsonImplR, WCF>>(
+          *LightOps[itail], *TailQudaDrvSolver, *TailQudaActSolver);
+      TailQuda->is_smeared = true;
+      LightTailSchur = TailQuda.get();
+    }
+    std::cout << GridLogMessage
+              << "[Ladder] tail DerivativeSolver/ActionSolver = QUDA CG, mass="
+              << ladder[itail] << std::endl;
+#else
+    std::cerr << "HASEN_QUDA_CG_TAIL requires a QUDA build.\n"; exit(1);
+#endif
+  } else {
+    if (std::getenv("HASEN_QUDA_FORCE_TAIL") != nullptr) {
+      std::cerr << "HASEN_QUDA_FORCE_TAIL=1 requires HASEN_QUDA_CG_TAIL=1 "
+                   "(v1: the tail's QUDA solvers supply gauge residency for "
+                   "the force calls).\n";
+      exit(1);
+    }
+    TailGrid = std::make_unique<
+        TwoFlavourSchurCloverActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>(
+        *LightOps[itail], *LightOpsF[itail], CG_light_md, CG_action);
+    TailGrid->is_smeared = true;
+    LightTailSchur = TailGrid.get();
+  }
+
+  // Strange EO log-det, the partner of the strange pseudofermion's Schur complement: with the
+  // pseudofermion on the ODD checkerboard (the default MP action, det S_oo = det M / det M_ee) it
+  // is -ln|det(M_ee)|; with the pseudofermion on the EVEN checkerboard (STRANGE_EVEN, or the QUDA
+  // force path QUDA_FORCE, det S_ee = det M / det M_oo) it is -ln|det(M_oo)|. With clover
+  // det M_ee != det M_oo, so this pairing is physics, not convention: the hybrid ran the even
+  // pseudofermion with the even log-det from 2026-06-24 to 2026-10-02 and sampled
+  // |det M| det M_ee / det M_oo (__docs/2026_10_02_strange_logdet_parity_mismatch.md, L189).
+  // The block follows the pseudofermion automatically. HASEN_GRID_STRANGE_LOGDET_ODD=1|0 forces
+  // it (0 with an even pseudofermion reproduces the old mis-paired action, for comparison runs
+  // only, and says so loudly).
+  const bool strange_even_pf = [] {
+    if (std::getenv("STRANGE_EVEN") != nullptr) return true;
+#ifdef GRID_HAVE_QUDA
+    if (std::getenv("QUDA_FORCE") != nullptr) return true;
+#endif
+    return false;
+  }();
+  const bool strange_logdet_odd = [strange_even_pf] {
+    const char *e = std::getenv("HASEN_GRID_STRANGE_LOGDET_ODD");
+    if (e && e[0] == '1') return true;
+    if (e && e[0] == '0') return false;
+    return strange_even_pf;
+  }();
+  QCDLogDetCompactCloverEOAction<WilsonImplR> StrangeLogDet(StrangeOp, 1,
+                                                            strange_logdet_odd ? Odd : Even);
+  std::cout << GridLogMessage << "[StrangeLogDet] block = " << (strange_logdet_odd ? "M_oo" : "M_ee")
+            << " (strange pseudofermion on " << (strange_even_pf ? "EVEN" : "ODD")
+            << " sites" << (strange_logdet_odd == strange_even_pf ? ", correctly paired)" : ")")
+            << std::endl;
+  if (strange_logdet_odd != strange_even_pf)
+    std::cout << GridLogMessage
+              << "[StrangeLogDet] WARNING: HASEN_GRID_STRANGE_LOGDET_ODD overrides the pairing:"
+              << " this run samples |det M| times det M_ee / det M_oo (or its inverse) at the"
+              << " strange mass, NOT the target ensemble (L189). Comparison runs only." << std::endl;
+  StrangeLogDet.is_smeared = true;
+  Action<LatticeGaugeField> *StrangeLogDetPtr = &StrangeLogDet;
+#ifdef GRID_HAVE_QUDA
+  std::unique_ptr<QCDLogDetCompactCloverEOQudaForceAction<WilsonImplR>> StrangeLogDetQuda;
+  if (quda_force_logdet_strange) {
+    QudaCloverParams qp_sld;
+    qp_sld.mass = mass_strange; qp_sld.csw = csw; qp_sld.anti_periodic_t = true;
+    qp_sld.tol = cg_tol_drv; qp_sld.max_iter = cg_max;
+    qp_sld.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+    qp_sld.use_multigrid = false;
+    if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+      qp_sld.recon_sloppy = QUDA_RECONSTRUCT_NO;
+    // Same block as the Grid action above (L189): the QUDA kernel traces on the parity opposite
+    // to its matpc, so the class picks EVEN_EVEN_ASYMMETRIC for the M_oo block.
+    StrangeLogDetQuda = std::make_unique<
+        QCDLogDetCompactCloverEOQudaForceAction<WilsonImplR>>(StrangeOp, 1, qp_sld,
+                                                               strange_logdet_odd ? Odd : Even);
+    StrangeLogDetQuda->is_smeared = true;
+    StrangeLogDetPtr = StrangeLogDetQuda.get();
+    std::cout << GridLogMessage
+              << "[Strange] LogDet FORCE ASSEMBLY = QUDA sigma-trace kernel, block "
+              << (strange_logdet_odd ? "M_oo" : "M_ee") << std::endl;
+  }
+#endif
+
+  // Strange RHMC. Bounds and degree matched to Chroma's rat_3strange monomial.
+  // Env-overridable for spectra where lo=1e-4 sits below lambda_min (phantom poles
+  // that QUDA's multishift cannot invert); e.g. 48^3 b6.3 needs RAT_LO~0.4 RAT_HI~35.
+  // CORRECTION 2026-10-05 (L191): 0.4 came from THIN links; the smeared-link strange spectrum at
+  // 48^3 b6.3 reaches lambda_min ~3e-3, so 0.4 left the action and force approximations wrong
+  // on the lowest modes. The launchers use RAT_LO 7e-4 (Chroma's); RAT_BOUNDS_CHECK_FREQ checks it.
+  const RealD rat_lo = TXQCDProduction::detail::env_real("RAT_LO", 1e-4);
+  const RealD rat_hi = TXQCDProduction::detail::env_real("RAT_HI", 100.0);
+  int rat_degree = 20;
+  if (const char *rd = std::getenv("RAT_DEGREE"); rd && *rd) rat_degree = std::atoi(rd);
+  std::cout << GridLogMessage << "Strange rational: lo=" << rat_lo << " hi=" << rat_hi
+            << " degree=" << rat_degree << std::endl;
+  // Force (MD) approximation and run-time bounds check (2026-10-05, L191; carried
+  // OneFlavourSchurCloverRationalAction.h, OneFlavourSchurRationalExtras). Unset = the behaviour
+  // before, bit for bit: the force x^(-1/2) at RAT_DEGREE and TUNE_CG_TOL_STRANGE, no check.
+  //   RAT_DEGREE_MD           degree of the force x^(-1/2) (default RAT_DEGREE); x^(+-1/4) for
+  //                           S and the heatbath keep RAT_DEGREE
+  //   TUNE_CG_TOL_STRANGE_MD  force multishift tolerance (default TUNE_CG_TOL_STRANGE); S and
+  //                           the heatbath keep TUNE_CG_TOL_STRANGE
+  //   RAT_BOUNDS_CHECK_FREQ   0 = off (default); n = check at refreshes 1, 1+n, 1+2n, ...
+  //   RAT_BOUNDS_CHECK_TOL    margin on |1 - Q r(Q)^p| on the refresh noise above p x the
+  //                           approximation's own Remez error (default 1e-6)
+  //   RAT_BOUNDS_CHECK_ABORT  0 = WARNING line and continue (default), 1 = abort
+  // The OneFlavourRationalParams slots mdtolerance (1e-6), BoundsCheckFreq (100) and
+  // BoundsCheckTol (1e-4) below are not read by the carried actions; their values are unchanged.
+  const int rat_degree_md = TXQCDProduction::detail::env_int("RAT_DEGREE_MD", rat_degree);
+  const RealD cg_tol_strange_md =
+      TXQCDProduction::detail::env_real("TUNE_CG_TOL_STRANGE_MD", cg_tol_strange);
+  const int rat_bc_freq = TXQCDProduction::detail::env_int("RAT_BOUNDS_CHECK_FREQ", 0);
+  const RealD rat_bc_tol = TXQCDProduction::detail::env_real("RAT_BOUNDS_CHECK_TOL", 1e-6);
+  bool rat_bc_abort = false;
+  if (const char *v = std::getenv("RAT_BOUNDS_CHECK_ABORT"); v && *v) {
+    const std::string s(v);
+    if (s == "1") rat_bc_abort = true;
+    else if (s != "0") {
+      std::cerr << "RAT_BOUNDS_CHECK_ABORT=" << v << ": must be 0 or 1.\n";
+      exit(1);
+    }
+  }
+  if (rat_degree_md < 1 || rat_bc_freq < 0 || !(cg_tol_strange_md > 0.0) || !(rat_bc_tol > 0.0)) {
+    std::cerr << "RAT_DEGREE_MD=" << rat_degree_md << " RAT_BOUNDS_CHECK_FREQ=" << rat_bc_freq
+              << " TUNE_CG_TOL_STRANGE_MD=" << cg_tol_strange_md << " RAT_BOUNDS_CHECK_TOL="
+              << rat_bc_tol << ": need degree >= 1, freq >= 0, tolerances > 0.\n";
+    exit(1);
+  }
+  std::cout << GridLogMessage << "Strange rational: degree_action=" << rat_degree
+            << " degree_md=" << rat_degree_md << " tol_action=" << cg_tol_strange
+            << " tol_md=" << cg_tol_strange_md << " bounds_check_freq=" << rat_bc_freq
+            << " bounds_check_tol=" << rat_bc_tol << " bounds_check_abort=" << rat_bc_abort
+            << std::endl;
+#ifdef HASEN_STRANGE_RATIONAL_EXTRAS
+  OneFlavourSchurRationalExtras strange_x;
+  strange_x.md_degree = rat_degree_md;
+  strange_x.md_tolerance = cg_tol_strange_md;
+  strange_x.bounds_check_freq = rat_bc_freq;
+  strange_x.bounds_check_tol = rat_bc_tol;
+  strange_x.bounds_check_abort = rat_bc_abort;
+#else
+  // Grid-TXQCD fork copies of the strange action headers: one degree and tolerance, no check.
+  if (rat_degree_md != rat_degree || cg_tol_strange_md != cg_tol_strange || rat_bc_freq != 0) {
+    std::cerr << "RAT_DEGREE_MD, TUNE_CG_TOL_STRANGE_MD and RAT_BOUNDS_CHECK_FREQ need the carried"
+              << " strange action headers (include/, build_driver_stock.sh); this build uses the"
+              << " fork's.\n";
+    exit(1);
+  }
+#endif
+  OneFlavourRationalParams strange_rat(rat_lo, rat_hi, cg_max, cg_tol_strange, rat_degree, 64, 100, 1e-6, 1e-4);
+  // FermOp template args must be the compact operator types (defaults are the
+  // non-compact WilsonCloverFermion).  The action body is operator-generic.
+  std::unique_ptr<OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>
+      StrangeBase;
+  // Same-parity validation holder: Grid-native EVEN-parity Schur monomial,
+  // opt-in via STRANGE_EVEN=1 (default off -> stock ODD-parity behavior).
+  std::unique_ptr<OneFlavourSchurCloverRationalActionEven<WilsonImplR, WCF>>
+      StrangeEven;
+  Action<LatticeGaugeField> *StrangePtr = nullptr;
+#ifdef GRID_HAVE_QUDA
+  // FermOp template args must be the compact operator types (WCF/WCF_f), same as
+  // the non-QUDA branch below; the action's defaults are the non-compact
+  // WilsonCloverFermion, which won't bind the compact StrangeOp/StrangeOpF.
+  std::unique_ptr<OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>
+      StrangeQuda;
+  if (std::getenv("QUDA_FORCE") != nullptr) {
+    if (rat_degree_md != rat_degree || cg_tol_strange_md != cg_tol_strange || rat_bc_freq != 0) {
+      std::cerr << "RAT_DEGREE_MD, TUNE_CG_TOL_STRANGE_MD and RAT_BOUNDS_CHECK_FREQ are not"
+                << " implemented on the QUDA_FORCE strange path.\n";
+      exit(1);
+    }
+    QudaCloverParams qp;
+    qp.mass = mass_strange; qp.csw = csw; qp.anti_periodic_t = true;
+    qp.tol = cg_tol_strange; qp.max_iter = cg_max;
+    qp.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+    // QUDA_FORCE_SLOPPY_DP=1 → run the strange multishift force solve fully DOUBLE
+    // (default cuda_prec_sloppy=SINGLE).  IMPORTANT: this does NOT fix the 48^3 b6.3
+    // wrong-force bug.  Test 4 (job 54678995) ran with this flag ON and the QUDA
+    // multishift still diverged ("too many true residual norm increases" → wrong
+    // force ‖F‖avg 18 / max 1857) even in full double.  So the 48^3 QUDA-strange
+    // failure is precision-INDEPENDENT (pure-Grid converges with the SAME shifts);
+    // the cause is in the QUDA operator/shift setup (kappa-form normalization of the
+    // Remez shifts / matpc), not sloppy precision.  See
+    // __docs/2026_6_19_quda_single_precision_issues_multishift_cg_strange.md.
+    if (std::getenv("QUDA_FORCE_SLOPPY_DP") != nullptr)
+      qp.cuda_prec_sloppy = QUDA_DOUBLE_PRECISION;
+    // QUDA_FORCE_RECON_NO=1 → reconstruct_sloppy = NO (full links). REQUIRED at
+    // 48^3: the antiperiodic-t phase is baked in by negating the last-timeslice
+    // time links (det=-1, not SU(3)); RECONSTRUCT_12 (the default) mis-rebuilds
+    // the 3rd row of those links (it assumes det=+1), corrupting the sloppy
+    // solve. Ported from gen_qcd_hasenbusch_tune_compact.cc (memory
+    // quda-strange-recon-fix) -- this driver's strange QUDA path never had it.
+    if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+      qp.recon_sloppy = QUDA_RECONSTRUCT_NO;
+    StrangeQuda = std::make_unique<
+        OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>(
+        StrangeOp, StrangeOpF, &RBGridF, strange_rat, qp, 50);
+    StrangeQuda->is_smeared = true;
+    StrangePtr = StrangeQuda.get();
+    std::cout << GridLogMessage << "[Strange] QUDA_FORCE active." << std::endl;
+  } else
+#endif
+  if (std::getenv("STRANGE_EVEN") != nullptr) {
+    // EVEN-parity Schur (same parity as the QUDA force path) so a pure-grid vs
+    // grid-quda comparison is same-pseudofermion; default unset -> stock ODD.
+    StrangeEven = std::make_unique<
+        OneFlavourSchurCloverRationalActionEven<WilsonImplR, WCF>>(
+#ifdef HASEN_STRANGE_RATIONAL_EXTRAS
+        StrangeOp, strange_rat, strange_x);
+#else
+        StrangeOp, strange_rat);
+#endif
+    StrangeEven->is_smeared = true;
+    StrangePtr = StrangeEven.get();
+    std::cout << GridLogMessage
+              << "[Strange] STRANGE_EVEN active — Grid native EVEN-parity Schur"
+              << std::endl;
+  } else {
+    StrangeBase = std::make_unique<
+        OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>(
+#ifdef HASEN_STRANGE_RATIONAL_EXTRAS
+        StrangeOp, StrangeOpF, &RBGridF, strange_rat, 50, strange_x);
+#else
+        StrangeOp, StrangeOpF, &RBGridF, strange_rat, 50);
+#endif
+    StrangeBase->is_smeared = true;
+    StrangePtr = StrangeBase.get();
+  }
+  Action<LatticeGaugeField> &StrangeSchurPF = *StrangePtr;
+
+  // LW gauge action matching Chroma's LW_TREE_GAUGEACT: rect coeff
+  // -beta/(20 u0^2) with u0 = the tadpole factor the ENSEMBLE was generated
+  // with (embedded in each config's .lime XML) -- cl21 48^3 b6.3:
+  // 0.84570646270714; cl3 16^3 b6.1: 0.832605301399891.  U0 must be set per
+  // ensemble: a mismatch leaves the imported config off-shell and the gauge
+  // relaxation drift drives the near-critical light sector singular
+  // (tau~=0.15 blow-up, root-caused 2026-07-07, confirmed job 55645079).
+  // NOTE this local default (1.0) shadows params.h's u0 default (0.8326) --
+  // never rely on either; scripts set U0 explicitly.
+  const RealD u0_ens = TXQCDProduction::detail::env_real("U0", 1.0);
+  PlaqPlusRectangleAction<PeriodicGimplR> GaugeAction(beta, -beta / (20.0 * u0_ens * u0_ens));
+  GaugeAction.is_smeared = false;
+  std::cout << GridLogMessage << std::setprecision(15)
+            << "[Action] BETA=" << beta << " U0=" << u0_ens
+            << " rect_coeff=" << -beta / (20.0 * u0_ens * u0_ens)
+            << " CSW=" << csw
+            << " MASS_LIGHT=" << mass_light
+            << " MASS_STRANGE=" << mass_strange
+            << std::setprecision(6) << std::endl;
+
+  // ── Integrator levels: general assignment of the four monomial groups ────
+  // Four groups -- light (ratio rungs + both log-dets), strange (RHMC), tail
+  // (bare det D(m_tail)), gauge -- each on one of up to four nested levels.
+  // In Grid's nested scheme a child level always runs 2 x multiplier x its
+  // parent's steps (each parent step recurses into the child once per drift
+  // slot -- same convention as Chroma's lcm_sts_*_recursive), so with level 0
+  // at MDSTEPS, level l runs n_l = 2 x mult_l x n_{l-1} steps per trajectory.
+  // Level 0's multiplier is pinned to 1: Grid divides the step size by EVERY
+  // level's multiplier, level 0 included, and this driver has always built the
+  // root with 1 so that MDSTEPS in the log means what it says.
+  //
+  // Two knob families, exactly one per run.  Both present = exit(1), even when
+  // the legacy one only carries its default value: a knob silently ignored at
+  // its default is how a log stops being the ground truth of what ran.
+  //   new (2026-10-13): HASEN_LEVEL_LIGHT / _STRANGE / _TAIL / _GAUGE in 0..3
+  //           (0 = root, fewest steps; all four required once any is set),
+  //           HASEN_LEVEL_MULT_1/2/3 >= 1 (default 1; one given for an unused
+  //           level is an error, never ignored); used levels contiguous from 0.
+  //   legacy: GAUGE_INNER_MULT (default 2), HASEN_STRANGE_LEVEL (middle = the
+  //           3-level light / strange / gauge layout; unset = 2-level),
+  //           HASEN_STRANGE_INNER_MULT (default 1), HASEN_TAIL_LEVEL
+  //           (outer|inner|middle, default outer).  They map onto the new
+  //           family exactly as the two hand-written layouts they replace:
+  //             2-level: light 0, strange 0, tail 0 (outer) / 1 (inner),
+  //                      gauge 1, mult_1 = GAUGE_INNER_MULT
+  //             3-level: light 0, strange 1, tail 0 / 1 / 2 (outer / middle /
+  //                      inner), gauge 2, mult_1 = HASEN_STRANGE_INNER_MULT,
+  //                      mult_2 = GAUGE_INNER_MULT
+  //           so a run with no knobs at all is bit-identical to the old binary.
+  //   HASEN_STRANGE_RUNGS=<csv> (0-based k of "PF<k>") routes the listed ratio
+  //           rungs to the strange's level, whatever it is -- for a rung whose
+  //           force needs the strange's finer dt but whose solve is cheap enough
+  //           that the extra evaluations are worth paying.  Orthogonal to SOLVER
+  //           routing (HASEN_GRID_MG_RUNGS etc.): it only picks which INTEGRATOR
+  //           level a rung's already-built solver gets evaluated at.  Error when
+  //           strange shares the light's level: the routing would be a no-op
+  //           silently accepted (the routed term would not be dropped -- it is
+  //           pushed either way -- but the knob would not do what it says).
+  //
+  // TRAP -- push order within a level is physics-visible: Integrator::refresh
+  // draws the pseudofermion noise from ONE shared pRNG stream in level/action
+  // order, and update_P sums the forces in that order.  The two legacy layouts
+  // used DIFFERENT orders (2-level: strange first; 3-level: strange last), and
+  // both must be reproduced for the no-knob run to stay bit-exact, so the rule
+  // below is: a level holding BOTH light and strange uses the 2-level order
+  // (strange, strange log-det, light log-det, all rungs, tail); any other level
+  // is light block (light log-det, strange log-det, un-routed rungs), routed
+  // rungs, tail, strange; the gauge action always last.  Gated bit-exact at
+  // 16^3 against both legacy layouts (perlmutter/gate16_levels_m9.sh).
+  // Changing this order changes the noise draws, not just the roundoff.
+  //
+  // Correctness: each action term is in exactly one level; the Metropolis test
+  // keeps the sampled distribution exact for any layout and multipliers -- only
+  // the integrator (discretization) error, hence acceptance/efficiency, changes.
+  // Cost: the batched smearing pullback (HASEN_GRID_BATCH_SMEAR) runs once per
+  // force call on every level that holds a smeared monomial, and the gauge-
+  // import skip / field-strength sharing fire only between operators imported
+  // at the same field, i.e. within one level's force call -- a monomial on a
+  // level of its own pays its own pullback and imports.  The [Levels] banner
+  // prints the force-call and smeared-monomial counts per level for that.
+  // History: the 2026-07-06 strange/light/gauge 3-level ran the light ladder 2x
+  // finer than strange (the recursion factor); the light sector is the
+  // expensive one and belongs on the root.  Nothing here forbids another order,
+  // the banner shows what was asked for.  See
+  // __docs/2026_7_6_integrator_step_accounting_summary.md,
+  // __docs/2026_7_11_three_level_integrator_plan.md,
+  // __docs/2026_08_10_integrator_factor_of_2_explained.md.
+  constexpr int kMaxLevels = 4;
+  auto env_present = [](const char *n) { const char *v = std::getenv(n); return v && *v; };
+  const char *level_knobs[]  = {"HASEN_LEVEL_LIGHT", "HASEN_LEVEL_STRANGE", "HASEN_LEVEL_TAIL",
+                                "HASEN_LEVEL_GAUGE", "HASEN_LEVEL_MULT_1", "HASEN_LEVEL_MULT_2",
+                                "HASEN_LEVEL_MULT_3"};
+  const char *legacy_knobs[] = {"GAUGE_INNER_MULT", "HASEN_STRANGE_LEVEL",
+                                "HASEN_STRANGE_INNER_MULT", "HASEN_TAIL_LEVEL"};
+  std::string level_knobs_seen, legacy_knobs_seen;
+  for (const char *n : level_knobs)  if (env_present(n)) level_knobs_seen  += std::string(" ") + n;
+  for (const char *n : legacy_knobs) if (env_present(n)) legacy_knobs_seen += std::string(" ") + n;
+  const bool general_knobs = !level_knobs_seen.empty();
+  if (general_knobs && !legacy_knobs_seen.empty()) {
+    std::cerr << "Integrator level knobs: both families are set -- HASEN_LEVEL_*:"
+              << level_knobs_seen << "  and legacy:" << legacy_knobs_seen
+              << ".  Use exactly one family (unset the legacy knobs, even at their defaults).\n";
+    exit(1);
+  }
+  std::set<int> strange_rungs = parse_rung_list("HASEN_STRANGE_RUNGS");
+
+  int lvl_light = 0, lvl_strange = 0, lvl_tail = 0, lvl_gauge = 1;
+  int lvl_mult[kMaxLevels] = {1, 1, 1, 1};
+  // Legacy-only state, kept for the legacy log lines below (byte-identical to
+  // the old binary's, downstream greps depend on them).
+  bool three_level = false;
+  int gauge_mult = 2, strange_mult = 1;
+  std::string tail_level = "outer";
+  if (general_knobs) {
+    auto env_level = [&](const char *n) {
+      if (!env_present(n)) {
+        std::cerr << "HASEN_LEVEL_* family in use but " << n << " is not set (all four of "
+                     "HASEN_LEVEL_LIGHT / _STRANGE / _TAIL / _GAUGE are required)\n";
+        exit(1);
+      }
+      const int v = std::atoi(std::getenv(n));
+      if (v < 0 || v >= kMaxLevels) {
+        std::cerr << n << " must be in 0.." << (kMaxLevels - 1) << " (0 = outermost), got '"
+                  << std::getenv(n) << "'\n";
+        exit(1);
+      }
+      return v;
+    };
+    lvl_light   = env_level("HASEN_LEVEL_LIGHT");
+    lvl_strange = env_level("HASEN_LEVEL_STRANGE");
+    lvl_tail    = env_level("HASEN_LEVEL_TAIL");
+    lvl_gauge   = env_level("HASEN_LEVEL_GAUGE");
+    for (int l = 1; l < kMaxLevels; ++l) {
+      const std::string n = "HASEN_LEVEL_MULT_" + std::to_string(l);
+      if (!env_present(n.c_str())) continue;
+      lvl_mult[l] = std::atoi(std::getenv(n.c_str()));
+    }
+  } else {
+    // Legacy family, parsed exactly as before (2026-07-06 .. 2026-10-12 binaries).
+    if (const char *gm = std::getenv("GAUGE_INNER_MULT"); gm && *gm) gauge_mult = std::atoi(gm);
+    const char *strange_level_env = std::getenv("HASEN_STRANGE_LEVEL");
+    three_level = (strange_level_env && std::string(strange_level_env) == "middle");
+    if (const char *sm = std::getenv("HASEN_STRANGE_INNER_MULT"); sm && *sm) strange_mult = std::atoi(sm);
+    const char *tail_level_env = std::getenv("HASEN_TAIL_LEVEL");
+    tail_level = (tail_level_env && *tail_level_env) ? tail_level_env : "outer";
+    if (tail_level != "outer" && tail_level != "inner" && tail_level != "middle") {
+      std::cerr << "HASEN_TAIL_LEVEL must be 'outer', 'inner', or 'middle', got '"
+                << tail_level << "'\n";
+      exit(1);
+    }
+    // In 2-level mode strange is not a distinct level: 'middle' and the rung
+    // routing would both be silent no-ops.  Fail loudly instead (as before).
+    if ((tail_level == "middle" || !strange_rungs.empty()) && !three_level) {
+      std::cerr << "HASEN_TAIL_LEVEL=middle / HASEN_STRANGE_RUNGS require the "
+                   "3-level integrator (HASEN_STRANGE_LEVEL=middle) -- strange "
+                   "is not a distinct level in 2-level mode.\n";
+      exit(1);
+    }
+    if (!three_level) {
+      lvl_light = 0; lvl_strange = 0; lvl_gauge = 1;
+      lvl_tail  = (tail_level == "inner") ? 1 : 0;
+      lvl_mult[1] = gauge_mult;
+    } else {
+      lvl_light = 0; lvl_strange = 1; lvl_gauge = 2;
+      lvl_tail  = (tail_level == "outer") ? 0 : (tail_level == "middle") ? 1 : 2;
+      lvl_mult[1] = strange_mult;
+      lvl_mult[2] = gauge_mult;
+    }
+  }
+  // Layout validation, both families.
+  const int lvl_of_group[4] = {lvl_light, lvl_strange, lvl_tail, lvl_gauge};
+  int n_levels = 0;
+  bool level_used[kMaxLevels] = {false, false, false, false};
+  for (int g = 0; g < 4; ++g) {
+    level_used[lvl_of_group[g]] = true;
+    n_levels = std::max(n_levels, lvl_of_group[g] + 1);
+  }
+  for (int l = 0; l < n_levels; ++l) {
+    if (!level_used[l]) {
+      std::cerr << "Integrator levels: level " << l << " holds no group but a deeper level "
+                   "is used -- level numbers must be contiguous from 0 (light=" << lvl_light
+                << " strange=" << lvl_strange << " tail=" << lvl_tail << " gauge=" << lvl_gauge
+                << ")\n";
+      exit(1);
+    }
+    if (lvl_mult[l] < 1) {
+      std::cerr << "Integrator levels: multiplier of level " << l << " must be >= 1, got "
+                << lvl_mult[l] << "\n";
+      exit(1);
+    }
+  }
+  for (int l = n_levels; l < kMaxLevels; ++l) {
+    const std::string n = "HASEN_LEVEL_MULT_" + std::to_string(l);
+    if (env_present(n.c_str())) {
+      std::cerr << n << " is set but only " << n_levels << " level(s) are used (0.."
+                << n_levels - 1 << "); a multiplier for an unused level is not ignored\n";
+      exit(1);
+    }
+  }
+  if (!strange_rungs.empty() && lvl_strange == lvl_light) {
+    std::cerr << "HASEN_STRANGE_RUNGS routes rungs to the strange's level, but strange and "
+                 "light share level " << lvl_strange << " -- the routing would be a no-op. "
+                 "Give the strange its own level (HASEN_LEVEL_STRANGE) or unset the list.\n";
+    exit(1);
+  }
+  auto level_of_rung = [&](int k) { return strange_rungs.count(k) ? lvl_strange : lvl_light; };
+  // Grid-MG sharers rely on the donor's gauge import (HASEN_GRID_MG_RUNGS above).  If
+  // HASEN_STRANGE_RUNGS puts a sharer and its donor on different integrator levels, the sharer
+  // can solve at a gauge field the donor has not imported yet.  Still exact to tol (the outer
+  // GCR runs on the sharer's own, current fp64 operator); only the preconditioner's fp32 fine
+  // operator lags, which can cost outer iterations.  Report it.  (The M3 Grid-MG HEATBATH
+  // solvers, HASEN_GRID_MG_HEATBATH_RUNGS, import the gauge themselves when the hierarchy does
+  // not carry it, so their refresh never lags and never meets an un-gauged hierarchy.)
+  if (GridMGH) {
+    for (int k : grid_mg_rungs)
+      if (level_of_rung(k) != level_of_rung(grid_mg_donor))
+        std::cout << GridLogMessage << "[Ladder] NOTE: Grid-MG rung " << k
+                  << " and its donor rung " << grid_mg_donor
+                  << " are on different integrator levels (HASEN_STRANGE_RUNGS): its MG "
+                     "preconditioner may see the previous gauge field (the solve itself "
+                     "stays on the current fp64 operator)" << std::endl;
+  }
+  if (!general_knobs) {
+    std::cout << GridLogMessage << "[Ladder] tail level = " << tail_level
+              << (tail_level == "inner"    ? " (with gauge — Chroma has_cancel placement)"
+                  : tail_level == "middle" ? " (with strange)"
+                                           : " (with the ladder rungs)")
+              << std::endl;
+  } else {
+    std::cout << GridLogMessage << "[Ladder] tail level = L" << lvl_tail
+              << (lvl_tail == lvl_light   ? " (with the ladder rungs)"
+                  : lvl_tail == lvl_strange ? " (with strange)"
+                  : lvl_tail == lvl_gauge   ? " (with gauge)"
+                                            : " (alone)")
+              << std::endl;
+  }
+
+  typedef Representations<EmptyRep<LatticeGaugeField>> Reps;
+  ActionSet<LatticeGaugeField, Reps> Aset;
+  // Grid's ActionLevel holds `actions` as a REFERENCE into its own actions_hirep;
+  // the copy that Aset.push_back() stores keeps that reference bound to THIS
+  // object.  So every ActionLevel pushed into Aset must outlive the Integrator
+  // ctor (built further down, "── HMC ──") -- declare them here at function
+  // scope, NOT inside a branch (in-branch scoping dangles the reference and
+  // segfaults at the ctor's action-summary print).  Only the first n_levels are
+  // populated and pushed into Aset; the rest stay empty and unused.  The
+  // multipliers were validated above (the ctor asserts mul >= 1).
+  ActionLevel<LatticeGaugeField, Reps> L0(1);            // root: always multiplier 1
+  ActionLevel<LatticeGaugeField, Reps> L1(lvl_mult[1]);
+  ActionLevel<LatticeGaugeField, Reps> L2(lvl_mult[2]);
+  ActionLevel<LatticeGaugeField, Reps> L3(lvl_mult[3]);
+  ActionLevel<LatticeGaugeField, Reps> *Lv[kMaxLevels] = {&L0, &L1, &L2, &L3};
+
+  if (!general_knobs) {
+    if (!three_level) {
+      std::cout << GridLogMessage
+                << "Integrator: 2-level (strange+light)/gauge  GAUGE_INNER_MULT="
+                << gauge_mult << std::endl;
+    } else {
+      const int n_light   = mdsteps;
+      const int n_strange = 2 * strange_mult * n_light;
+      const int n_gauge   = 2 * gauge_mult   * n_strange;
+      std::cout << GridLogMessage
+                << "Integrator: 3-level light/strange/gauge+tail  MDSTEPS(light)="
+                << mdsteps << "  STRANGE_INNER_MULT=" << strange_mult
+                << "  GAUGE_INNER_MULT=" << gauge_mult << std::endl;
+      std::cout << GridLogMessage << "[3-level] steps/traj: light=" << n_light
+                << "  strange=" << n_strange << "  gauge=" << n_gauge << std::endl;
+    }
+  } else {
+    std::cout << GridLogMessage << "Integrator: general level assignment (HASEN_LEVEL_*), "
+              << n_levels << " level(s)  MDSTEPS(level 0)=" << mdsteps << std::endl;
+  }
+
+  // Assembly: the push order per level is the TRAP rule in the header comment.
+  for (int l = 0; l < n_levels; ++l) {
+    ActionLevel<LatticeGaugeField, Reps> &L = *Lv[l];
+    const bool has_light = (lvl_light == l), has_strange = (lvl_strange == l);
+    const bool has_tail  = (lvl_tail  == l), has_gauge   = (lvl_gauge   == l);
+    if (has_light && has_strange) {
+      // The 2-level order (strange_rungs is empty here, checked above).
+      L.push_back(&StrangeSchurPF);
+      L.push_back(StrangeLogDetPtr);
+      L.push_back(LightLogDetPtr);
+      for (auto &pf : RatioPF) L.push_back(pf.get());
+      if (has_tail) L.push_back(LightTailSchur);
+    } else {
+      if (has_light) {
+        L.push_back(LightLogDetPtr);
+        L.push_back(StrangeLogDetPtr);   // negligible force -> cheapest (coarsest) slot
+        for (int k = 0; k < n_pf; ++k)
+          if (!strange_rungs.count(k)) L.push_back(RatioPF[k].get());
+      }
+      if (has_strange)
+        for (int k = 0; k < n_pf; ++k)
+          if (strange_rungs.count(k)) L.push_back(RatioPF[k].get());
+      if (has_tail)    L.push_back(LightTailSchur);
+      if (has_strange) L.push_back(&StrangeSchurPF);
+    }
+    if (has_gauge) L.push_back(&GaugeAction);
+    Aset.push_back(L);   // coarsest pushed first
+  }
+
+  // [Levels] banner: the resolved layout, steps per level per trajectory, the
+  // force-gradient force-call count 3n+1 per level, and how many members are
+  // smeared (= batched smearing pullbacks per force call on that level).
+  {
+    std::ostringstream mults;
+    for (int l = 1; l < n_levels; ++l) mults << (l > 1 ? "," : "") << lvl_mult[l];
+    std::cout << GridLogMessage << "[Levels] light=L" << lvl_light << " strange=L" << lvl_strange
+              << " tail=L" << lvl_tail << " gauge=L" << lvl_gauge << " mults="
+              << (n_levels > 1 ? mults.str() : std::string("none")) << " levels=" << n_levels
+              << (general_knobs ? " (HASEN_LEVEL_*)" : " (legacy knobs)") << std::endl;
+    int n_steps = mdsteps;
+    for (int l = 0; l < n_levels; ++l) {
+      if (l > 0) n_steps *= 2 * lvl_mult[l];
+      int n_smeared = 0;
+      std::ostringstream members;
+      for (auto *a : Lv[l]->actions) {
+        if (a->is_smeared) ++n_smeared;
+        members << " " << a->action_name();
+      }
+      std::cout << GridLogMessage << "[Levels] L" << l << ": mult " << lvl_mult[l]
+                << ", steps/traj " << n_steps << ", FG force calls " << 3 * n_steps + 1
+                << ", smeared monomials " << n_smeared << "/" << Lv[l]->actions.size()
+                << ", members:" << members.str() << std::endl;
+    }
+  }
+
+  // ── Stout smearing ────────────────────────────────────────────────────────
+  Smear_Stout<PeriodicGimplR> Stout(stout_rho_inv);
+  SmearedConfiguration<PeriodicGimplR> Smear(&Grid_, stout_nsmear_inv, Stout);
+  Smear.set_Field(Umu);
+
+  // ── Force norm observer ───────────────────────────────────────────────────
+  ForceNormObserver ForceObs;
+  ForceObs.refs.push_back({"LightLogDet", LightLogDetPtr});
+  for (int k = 0; k < n_pf; ++k)
+    ForceObs.refs.push_back({"PF" + std::to_string(k), RatioPF[k].get()});
+  ForceObs.refs.push_back({"LightSchurPF", LightTailSchur});
+  ForceObs.refs.push_back({"Strange",       &StrangeSchurPF});
+  ForceObs.refs.push_back({"StrangeLogDet", StrangeLogDetPtr});
+  ForceObs.refs.push_back({"Gauge",         &GaugeAction});
+
+  // ── Forces-only mode (fast Hasenbusch mass tuning) ────────────────────────
+  // FORCES_ONLY=1: skip the integrator entirely.  Heatbath each action and
+  // evaluate its MD force once on the (smeared) imported config — exactly as the
+  // integrator's first P-update does — then print the per-level avg/max force
+  // norm (the Hasenbusch tuning signal), averaged over FORCES_SAMPLES draws.
+  // FORCES_SKIP_STRANGE=1 omits the expensive strange RHMC force.  Combine with
+  // TUNE_CG_TOL_* for fast tuning iterations (no full trajectory needed).
+  // FORCES_SKIP_RUNGS=i,j,...  omits specific PF ratio rungs by 0-based index.
+  // FORCES_SKIP_TAIL=1         omits the bare-det tail (LightSchurPF).
+  // Use when only a subset of rungs changed vs the previous scan: the forces on
+  // unchanged rungs are identical (same gauge config, same seeds), so recomputing
+  // them wastes time.  E.g. scanning only mid-ladder rungs 2,3:
+  //   FORCES_SKIP_RUNGS=0,1,4 FORCES_SKIP_TAIL=1  (skip unchanged light+heavy end)
+  //   FORCES_SKIP_RUNGS=0,1   (skip near-critical end, keep tail in the output)
+  // LightLogDet is NOT covered (use FORCES_SKIP_LIGHT); each PF rung index
+  // matches the k in "PF<k>" printed in the log.
+  // FORCES_STIFFNESS=1 (2026-10-14): the stiffness screen (finite differences of
+  // every force at displaced links, contracted with the forces and a momentum
+  // draw) instead of this loop; its own comment block below, same FORCES_SAMPLES.
+  // CAVEAT 1 (pRNG coupling): refresh() draws from ONE shared pRNG stream, in ref
+  // order, ACROSS samples.  A skipped rung does not consume its draw, so every
+  // level after it -- including the next SAMPLE's early levels -- sees different
+  // noise than in a full run.  Measured 2026-08-11 (base+G, seed 300): sample 0
+  // reproduced the full run bit-for-bit, samples 1-2 drifted ~2% on avg and ~5%
+  // on max.  Consequence: only compare scans that share the SAME skip set.  To
+  // compare against an older ladder, re-run that ladder as a control INSIDE the
+  // skipped scan rather than quoting its numbers from a full scan.
+  // CAVEAT 2 (MG donor): do not skip the rung named by HASEN_MG_RUNG while any
+  // HASEN_MG_SHARED_RUNGS rung is still live -- the donor builds its MG subspace
+  // only when it solves.  Enforced with a fatal error below.
+  if (std::getenv("FORCES_ONLY") != nullptr) {
+    int nsamp = 1;
+    if (const char *ns = std::getenv("FORCES_SAMPLES"); ns && *ns) nsamp = std::atoi(ns);
+
+    // ── Stiffness screen: FORCES_ONLY=1 FORCES_STIFFNESS=1 (2026-10-14) ──────────
+    // What: at the imported configuration, the stiffness of every monomial (the
+    // derivative of its force along a direction) from finite differences of the
+    // force at displaced thin links, U' = exp(eps vhat) U, with the pseudofermions
+    // held fixed, contracted with every stored force and with a momentum draw.
+    // Why: at TRAJL 1.0 the near-critical ratio rungs' integration error is set by
+    // their stiffness, not by their force, so the force norms above cannot rank
+    // ladders; the h^4 terms of dH are built from exactly these contractions
+    // (__docs/2026_10_14_notes_dh_force_stiffness.md, handoff
+    // 2026_10_14_handoff_stiffness_screen.md).  The trajectory's force-gradient
+    // kick already evaluates each force at links displaced along the level force
+    // (Integrator_algorithm.h FG_update_P); this does the same along chosen
+    // directions, once, without a trajectory.
+    // Sequence per sample (deliberately NOT the plain FORCES_ONLY loop below):
+    //   1. momenta, then the heatbaths in the INTEGRATOR's order (generate_momenta,
+    //      then refresh level by level over Aset, as Integrator::refresh does), so the
+    //      same seed gives the trajectory's draws and the undisplaced forces equal the
+    //      trajectory's first update_P forces, raw and pulled back.
+    //   2. F_a at U for every monomial: deriv on the smeared links, the stout pullback,
+    //      Ta (the stock ActionBase::deriv(ConfigurationBase&) sequence, done here in
+    //      two steps so the raw pre-pullback norm can be logged next to the batched
+    //      trajectory lines); the gauge action directly on the thin links, as below.
+    //   3. per direction v (FORCES_STIFF_DIRS) and eps (FORCES_STIFF_EPS):
+    //      vhat = v / sqrt(maxLocalNorm2(v)), so eps is the largest link rotation;
+    //      F_a at U+ = exp(+eps vhat) U and, central (default), U- = exp(-eps vhat) U;
+    //      M_a vhat = (F_a(U+) - F_a(U-)) / (2 eps)   [one-sided: (F_a(U+) - F_a(U)) / eps]
+    //      D2_a     = (F_a(U+) - 2 F_a(U) + F_a(U-)) / eps^2   (nonlinearity along vhat)
+    //      logged: |M_a vhat|^2, <vhat, M_a vhat>, <P, M_a vhat>, <F_b, M_a vhat> for
+    //      every b, |D2_a|^2, <vhat, D2_a>, <P, D2_a>, and the Gram matrix
+    //      <M_a vhat, M_b vhat> (FORCES_STIFF_GRAM: P = the momentum direction only, the
+    //      default, the one direction whose h^4 term is quadratic in M; all; 0 = none; the
+    //      stored M_a vhat exist only while a Gram direction runs).
+    //      <a, b> = Re sum_x tr(a^dag b) (Grid innerProduct), so <F, F> = |F|^2.
+    //      The gauge action is evaluated at U, U+, U-: its first and second differences
+    //      along vhat check the gauge force and stiffness (dS/deps = 2 Re<vhat, F>, the
+    //      update_field / update_P conventions; the "gaugecheck" line prints both sides).
+    // Directions: gauge = F_Gauge, tail = F_LightSchurPF, strange = F_Strange +
+    // F_StrangeLogDet, light = F_LightLogDet + sum_k F_PFk, P = the momentum draw of
+    // step 1 (production normalisation), a level name (LightLogDet, PF<k>, LightSchurPF,
+    // Strange, StrangeLogDet, Gauge) = that monomial's force alone, each = one direction
+    // per monomial (every level name, in order).  Contractions are logged for vhat;
+    // |v|_max and |v|^2 are logged per direction, so the unnormalised contraction is vmax
+    // times the logged one.  M_a is linear, so a level's force direction is the sum over
+    // its monomials (or groups) of the logged, rescaled contractions, for any level
+    // layout when the directions are per monomial; the Gram entries are not additive.
+    // Trap: every object that caches the gauge field decides by CONTENT (the import
+    // guard compares fields exactly, the MG hierarchy and the mixed-CG wrapper by trace
+    // fingerprint), so a displaced field is always re-imported; the MG null space is
+    // kept (a preconditioner only, the solve converges to its tolerance).  Linearity
+    // and solver-floor: D2 and a second eps value show it; the FG kick's own
+    // displacement is (h^2/24)|F_level|_max ~ 2e-4 (inner, 48 steps) to 3e-3 (12 steps).
+    // Knobs (all optional): FORCES_STIFF_DIRS csv of gauge,tail,strange,light,P, level
+    //   names, each (default gauge,tail,strange,P; "none" = step 1-2 only); FORCES_STIFF_EPS csv
+    //   (default 1e-3); FORCES_STIFF_ONESIDED=1; FORCES_STIFF_ACTIONS csv of the level
+    //   names above whose displaced forces are computed (default all; the others are
+    //   still evaluated at U and used as F_b); FORCES_STIFF_GRAM=P|all|0 (default P).
+    //   FORCES_SAMPLES applies (new momenta and noise per sample); FORCES_SKIP_* are refused.
+    // Output: "FORCES_STIFF <kind> key=value ..." lines, kinds meta, refresh, force, P,
+    //   gram0, dir, stiff, gram, gaugecheck; 10 significant digits.  Table script:
+    //   5_studies/hasenbusch_tune/data_extraction_scripts/stiffness_screen_table.py.
+    // Memory: nref stored forces + nref stored M_a vhat (while a Gram direction runs) + 7
+    // work fields (P, v, vhat, U+, U-, F+, F-, D2 share 8); 0.4 GB each at 48^3 on 16 ranks.
+    if (std::getenv("FORCES_STIFFNESS") != nullptr) {
+      typedef LatticeGaugeField GF;
+      for (const char *k : {"FORCES_SKIP_STRANGE", "FORCES_SKIP_GAUGE", "FORCES_SKIP_LIGHT",
+                            "FORCES_SKIP_TAIL", "FORCES_SKIP_RUNGS"})
+        if (std::getenv(k) != nullptr) {
+          std::cout << GridLogError << "[FORCES_STIFF] FATAL: " << k
+                    << " is not supported with FORCES_STIFFNESS=1 (heatbaths run in the "
+                       "integrator's order, nothing is skipped)" << std::endl;
+          assert(0 && "FORCES_SKIP_* with FORCES_STIFFNESS");
+        }
+      auto csv = [](const char *name, const std::string &dflt) {
+        std::vector<std::string> out;
+        std::string s = dflt;
+        if (const char *e = std::getenv(name); e && *e) s = e;
+        std::stringstream ss(s); std::string tok;
+        while (std::getline(ss, tok, ',')) if (!tok.empty()) out.push_back(tok);
+        return out;
+      };
+      auto join = [](const std::vector<std::string> &v) {
+        std::string s;
+        for (size_t i = 0; i < v.size(); ++i) s += (i ? "," : "") + v[i];
+        return s.empty() ? std::string("none") : s;
+      };
+      const std::vector<std::string> dirs_in = csv("FORCES_STIFF_DIRS", "gauge,tail,strange,P");
+      const std::vector<std::string> eps_str = csv("FORCES_STIFF_EPS", "1e-3");
+      std::vector<double> eps_list;
+      for (auto &t : eps_str) eps_list.push_back(std::atof(t.c_str()));
+      const bool central = std::getenv("FORCES_STIFF_ONESIDED") == nullptr;
+      const char *gram_env = std::getenv("FORCES_STIFF_GRAM");
+      const std::string gram_mode = (gram_env && *gram_env) ? std::string(gram_env) : std::string("P");
+      if (gram_mode != "P" && gram_mode != "all" && gram_mode != "0") {
+        std::cout << GridLogError << "[FORCES_STIFF] FATAL: FORCES_STIFF_GRAM must be P, all or 0, got '"
+                  << gram_mode << "'" << std::endl;
+        assert(0 && "bad FORCES_STIFF_GRAM");
+      }
+      const std::vector<std::string> diff_list = csv("FORCES_STIFF_ACTIONS", "");
+      const std::set<std::string> diff_acts(diff_list.begin(), diff_list.end());
+      const int nref = (int)ForceObs.refs.size();
+      auto ref_index = [&](const std::string &nm) {
+        for (int i = 0; i < nref; ++i) if (ForceObs.refs[i].name == nm) return i;
+        return -1;
+      };
+      auto name_of = [&](Action<GF> *a) -> std::string {
+        for (auto &r : ForceObs.refs) if (r.act == a) return r.name;
+        return a->action_name();
+      };
+      auto group_of = [](const std::string &nm) -> std::string {
+        if (nm == "Gauge") return "gauge";
+        if (nm == "LightSchurPF") return "tail";
+        if (nm == "Strange" || nm == "StrangeLogDet") return "strange";
+        return "light";   // LightLogDet, PF<k>
+      };
+      // "each" expands to one direction per monomial (the level names, in ForceObs order).
+      std::vector<std::string> dirs;
+      for (auto &d : dirs_in) {
+        if (d == "each") { for (auto &r : ForceObs.refs) dirs.push_back(r.name); continue; }
+        if (d != "gauge" && d != "tail" && d != "strange" && d != "light" && d != "P" && d != "none"
+            && ref_index(d) < 0) {
+          std::cout << GridLogError << "[FORCES_STIFF] FATAL: FORCES_STIFF_DIRS entry '" << d
+                    << "' is not one of gauge,tail,strange,light,P,none,each or a level name" << std::endl;
+          assert(0 && "bad FORCES_STIFF_DIRS");
+        }
+        dirs.push_back(d);
+      }
+      for (double e : eps_list)
+        if (!(e > 0.0)) {
+          std::cout << GridLogError << "[FORCES_STIFF] FATAL: FORCES_STIFF_EPS entries must be > 0" << std::endl;
+          assert(0 && "bad FORCES_STIFF_EPS");
+        }
+      for (auto &nm : diff_acts)
+        if (ref_index(nm) < 0) {
+          std::cout << GridLogError << "[FORCES_STIFF] FATAL: FORCES_STIFF_ACTIONS entry '" << nm
+                    << "' is not a FORCES_ONLY level name" << std::endl;
+          assert(0 && "bad FORCES_STIFF_ACTIONS");
+        }
+      const int ig = ref_index("Gauge");
+      const double gsites = (double)Grid_.gSites();
+      const std::streamsize oldprec = std::cout.precision();
+      std::cout.precision(10);
+      auto out = [&]() -> std::ostream & { return std::cout << GridLogMessage << "FORCES_STIFF "; };
+      auto secs = [](const std::chrono::steady_clock::time_point &t0) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      };
+      out() << "meta samples=" << nsamp << " nref=" << nref << " gsites=" << gsites
+            << " central=" << (central ? 1 : 0) << " gram=" << gram_mode
+            << " dirs=" << join(dirs) << " eps=" << join(eps_str)
+            << " diff_actions=" << (diff_acts.empty() ? std::string("all") : join(diff_list))
+            << std::endl;
+      // Pulled-back, Ta-projected force of one monomial at the thin links Smear holds
+      // (Uthin must be the field given to the last Smear.set_Field).  Optional raw
+      // (pre-pullback, Ta-projected) norms for the comparison with the batched
+      // trajectory lines.
+      auto eval_force = [&](Action<GF> *act, GF &Uthin, GF &force, double *raw_avg, double *raw_max) {
+        if (act->is_smeared) {
+          act->deriv(Smear.get_U(true), force);   // dS/dU_smeared, unprojected
+          if (raw_avg) {
+            GF raw = PeriodicGimplR::projectForce(force);
+            *raw_avg = std::sqrt(norm2(raw) / gsites);
+            *raw_max = std::sqrt(maxLocalNorm2(raw));
+          }
+          Smear.smeared_force(force);              // stout chain rule to the thin links, then Ta
+        } else {
+          act->deriv(Uthin, force);                // gauge action: thin links, no wrapper (see below)
+        }
+        force = PeriodicGimplR::projectForce(force);
+        if (raw_avg && !act->is_smeared) {
+          *raw_avg = std::sqrt(norm2(force) / gsites);
+          *raw_max = std::sqrt(maxLocalNorm2(force));
+        }
+      };
+      for (int s = 0; s < nsamp; ++s) {
+        // 1. momenta, then every heatbath in the integrator's level/action order.
+        GF P(&Grid_);
+        PeriodicGimplR::generate_momenta(P, sRNG, pRNG);
+        Smear.set_Field(Umu);
+        for (int l = 0; l < (int)Aset.size(); ++l)
+          for (int a = 0; a < (int)Aset[l].actions.size(); ++a) {
+            Action<GF> *act = Aset[l].actions.at(a);
+            auto t0 = std::chrono::steady_clock::now();
+            act->refresh(Smear, sRNG, pRNG);
+            out() << "refresh sample=" << s << " level=" << l << " idx=" << a
+                  << " act=" << name_of(act) << " time=" << secs(t0) << std::endl;
+          }
+        // 2. forces at U, plus the Gram matrix of the forces and P.
+        std::vector<std::unique_ptr<GF>> F(nref);
+        for (int i = 0; i < nref; ++i) {
+          F[i].reset(new GF(&Grid_));
+          double ravg = 0.0, rmax = 0.0;
+          auto t0 = std::chrono::steady_clock::now();
+          eval_force(ForceObs.refs[i].act, Umu, *F[i], &ravg, &rmax);
+          const double t = secs(t0);
+          const double n2 = norm2(*F[i]);
+          out() << "force sample=" << s << " act=" << ForceObs.refs[i].name
+                << " avg=" << std::sqrt(n2 / gsites) << " max=" << std::sqrt(maxLocalNorm2(*F[i]))
+                << " raw_avg=" << ravg << " raw_max=" << rmax << " norm2=" << n2
+                << " time=" << t << std::endl;
+        }
+        const double P2 = norm2(P);
+        out() << "P sample=" << s << " norm2=" << P2 << " avg=" << std::sqrt(P2 / gsites)
+              << " max=" << std::sqrt(maxLocalNorm2(P)) << std::endl;
+        for (int i = 0; i < nref; ++i) {
+          for (int j = i; j < nref; ++j)
+            out() << "gram0 sample=" << s << " a=" << ForceObs.refs[i].name << " b=" << ForceObs.refs[j].name
+                  << " dot=" << real(innerProduct(*F[i], *F[j])) << std::endl;
+          out() << "gram0 sample=" << s << " a=" << ForceObs.refs[i].name << " b=P"
+                << " dot=" << real(innerProduct(*F[i], P)) << std::endl;
+        }
+        const double S0 = GaugeAction.S(Umu);
+        // 3. displaced evaluations per direction and eps.
+        for (auto &dname : dirs) {
+          if (dname == "none") continue;
+          GF v(&Grid_); v = Zero();
+          if (dname == "P") v = P;
+          else if (ref_index(dname) >= 0) v = *F[ref_index(dname)];
+          else for (int i = 0; i < nref; ++i)
+            if (group_of(ForceObs.refs[i].name) == dname) v = v + *F[i];
+          const double vmax = std::sqrt(maxLocalNorm2(v)), v2 = norm2(v);
+          if (!(vmax > 0.0)) {
+            out() << "dir sample=" << s << " dir=" << dname << " vmax=0 skipped" << std::endl;
+            continue;
+          }
+          GF vhat(&Grid_); vhat = v * (1.0 / vmax);
+          out() << "dir sample=" << s << " dir=" << dname << " vmax=" << vmax << " norm2=" << v2
+                << " dot_P=" << real(innerProduct(vhat, P)) << std::endl;
+          const bool want_gram = (gram_mode == "all") || (gram_mode == "P" && dname == "P");
+          for (double eps : eps_list) {
+            GF Up(&Grid_); Up = Umu; PeriodicGimplR::update_field(vhat, Up, eps);
+            GF Um(&Grid_); Um = Umu;
+            if (central) PeriodicGimplR::update_field(vhat, Um, -eps);
+            const double Sp = GaugeAction.S(Up);
+            const double Sm = central ? GaugeAction.S(Um) : S0;
+            std::vector<std::unique_ptr<GF>> Mv(nref);
+            GF Fp(&Grid_), Fm(&Grid_), D2(&Grid_);
+            double gauge_dot_v = 0.0;
+            bool gauge_done = false;
+            for (int i = 0; i < nref; ++i) {
+              const std::string &nm = ForceObs.refs[i].name;
+              if (!diff_acts.empty() && !diff_acts.count(nm)) continue;
+              Action<GF> *act = ForceObs.refs[i].act;
+              auto t0 = std::chrono::steady_clock::now();
+              Smear.set_Field(Up);
+              eval_force(act, Up, Fp, nullptr, nullptr);
+              const double tp = secs(t0);
+              double tm = 0.0;
+              if (central) {
+                t0 = std::chrono::steady_clock::now();
+                Smear.set_Field(Um);
+                eval_force(act, Um, Fm, nullptr, nullptr);
+                tm = secs(t0);
+              }
+              Mv[i].reset(new GF(&Grid_));
+              if (central) {
+                *Mv[i] = Fp - Fm;
+                *Mv[i] = (*Mv[i]) * (0.5 / eps);
+                D2 = Fp + Fm;
+                D2 = D2 - (*F[i]) * 2.0;
+                D2 = D2 * (1.0 / (eps * eps));
+              } else {
+                *Mv[i] = Fp - (*F[i]);
+                *Mv[i] = (*Mv[i]) * (1.0 / eps);
+              }
+              const double dot_v = real(innerProduct(vhat, *Mv[i]));
+              if (i == ig) { gauge_dot_v = dot_v; gauge_done = true; }
+              std::ostream &o = out() << "stiff sample=" << s << " dir=" << dname << " eps=" << eps
+                                      << " act=" << nm << " norm2_Mv=" << norm2(*Mv[i])
+                                      << " dot_v=" << dot_v << " dot_P=" << real(innerProduct(P, *Mv[i]));
+              for (int b = 0; b < nref; ++b)
+                o << " dot_" << ForceObs.refs[b].name << "=" << real(innerProduct(*F[b], *Mv[i]));
+              if (central)
+                o << " norm2_D2=" << norm2(D2) << " dot_v_D2=" << real(innerProduct(vhat, D2))
+                  << " dot_P_D2=" << real(innerProduct(P, D2));
+              o << " plus_avg=" << std::sqrt(norm2(Fp) / gsites);
+              if (central) o << " minus_avg=" << std::sqrt(norm2(Fm) / gsites);
+              o << " time_plus=" << tp << " time_minus=" << tm << std::endl;
+              if (!want_gram) Mv[i].reset();
+            }
+            if (want_gram)
+              for (int i = 0; i < nref; ++i)
+                for (int j = i; j < nref; ++j)
+                  if (Mv[i] && Mv[j])
+                    out() << "gram sample=" << s << " dir=" << dname << " eps=" << eps
+                          << " a=" << ForceObs.refs[i].name << " b=" << ForceObs.refs[j].name
+                          << " dot=" << real(innerProduct(*Mv[i], *Mv[j])) << std::endl;
+            if (ig >= 0) {
+              const double dS1 = central ? (Sp - Sm) / (2.0 * eps) : (Sp - S0) / eps;
+              std::ostream &o = out() << "gaugecheck sample=" << s << " dir=" << dname << " eps=" << eps
+                                      << " S0=" << S0 << " Sp=" << Sp << " Sm=" << Sm
+                                      << " dS1=" << dS1 << " fd1=" << 2.0 * real(innerProduct(vhat, *F[ig]));
+              if (central) o << " dS2=" << (Sp - 2.0 * S0 + Sm) / (eps * eps);
+              if (gauge_done) o << " fd2=" << 2.0 * gauge_dot_v;
+              o << std::endl;
+            }
+            Smear.set_Field(Umu);   // the smearer holds U again before the next eps/direction/sample
+          }
+        }
+      }
+      std::cout.precision(oldprec);
+      std::cout << GridLogMessage << "FORCES_STIFF done samples=" << nsamp << std::endl;
+      Grid_finalize();
+      return 0;
+    }
+
+    const bool skip_strange = std::getenv("FORCES_SKIP_STRANGE") != nullptr;
+    const bool skip_gauge   = std::getenv("FORCES_SKIP_GAUGE")   != nullptr;
+    const bool skip_light   = std::getenv("FORCES_SKIP_LIGHT")   != nullptr;  // LogDet + PF ladder + Schur PF
+    const bool skip_tail    = std::getenv("FORCES_SKIP_TAIL")    != nullptr;  // bare-det tail (LightSchurPF) only
+    std::set<int> skip_rungs;
+    if (const char *sr = std::getenv("FORCES_SKIP_RUNGS"); sr && *sr) {
+      std::stringstream ss(sr); std::string tok;
+      while (std::getline(ss, tok, ',')) if (!tok.empty()) skip_rungs.insert(std::atoi(tok.c_str()));
+    }
+    auto skip = [&](const std::string &nm) {
+      if (skip_strange && (nm == "Strange" || nm == "StrangeLogDet")) return true;
+      if (skip_gauge   && nm == "Gauge") return true;
+      if (skip_light   && (nm == "LightLogDet" || nm == "LightSchurPF" || nm.rfind("PF", 0) == 0)) return true;
+      if (skip_tail    && nm == "LightSchurPF") return true;
+      if (!skip_rungs.empty() && nm.rfind("PF", 0) == 0) {
+        int k = std::atoi(nm.c_str() + 2);
+        if (skip_rungs.count(k)) return true;
+      }
+      return false;
+    };
+    // ── pRNG compensation for skipped rungs ──────────────────────────────────
+    // Each ratio rung's refresh() draws EXACTLY one gaussian on the full fermion
+    // grid (TwoFlavourSchurCloverRatioAction.h), the bare-det tail draws exactly
+    // one too (TwoFlavourSchurCloverAction.h), and LightLogDet draws none (empty
+    // refresh).  Grid's GridParallelRNG is per-site, so replaying that single
+    // draw and discarding it advances the RNG state exactly as the real refresh
+    // would have.  A skipped run is then bit-identical to a full run on every
+    // rung it DOES compute, for EVERY sample -- not just sample 0 -- so skipped
+    // and full scans stay paired draw-for-draw.  Cost is one gaussian fill
+    // (~tens of ms) in place of a 10-90 s solve.
+    // Scope is deliberately limited to the rungs/tail skipped via the two NEW
+    // knobs (FORCES_SKIP_RUNGS / FORCES_SKIP_TAIL), so every pre-existing env
+    // combination -- FORCES_SKIP_LIGHT / _STRANGE / _GAUGE -- still reproduces
+    // its historical numbers untouched.  FORCES_SKIP_NO_RNG_COMPENSATE=1 opts
+    // out (restores the raw stream-shifting behaviour).
+    const bool rng_compensate = (!skip_rungs.empty() || skip_tail) && !skip_light
+                             && std::getenv("FORCES_SKIP_NO_RNG_COMPENSATE") == nullptr;
+    auto skipped_by_new_knobs = [&](const std::string &nm) {
+      if (skip_tail && nm == "LightSchurPF") return true;
+      if (!skip_rungs.empty() && nm.rfind("PF", 0) == 0)
+        return skip_rungs.count(std::atoi(nm.c_str() + 2)) != 0;
+      return false;
+    };
+    std::unique_ptr<WCF::FermionField> rng_eta;
+    if (rng_compensate) {
+      rng_eta = std::make_unique<WCF::FermionField>(LightOps[0]->FermionGrid());
+      std::cout << GridLogMessage
+                << "[FORCES_ONLY] pRNG compensation ON: skipped rungs/tail still "
+                   "consume their heatbath draw -- computed rungs match a full run"
+                << std::endl;
+    }
+    LatticeGaugeField force(&Grid_);
+    const int nref = (int)ForceObs.refs.size();
+    std::vector<double> acc_avg(nref, 0.0), acc_max(nref, 0.0), acc_time(nref, 0.0), acc_refresh(nref, 0.0);
+#ifdef GRID_HAVE_QUDA
+    // Everything that BORROWS the donor's MG handle: shared-MG deriv rungs AND
+    // shared-MG heatbath rungs.  The heatbath borrowers matter for the donor's
+    // lifetime exactly as much as the deriv ones -- e.g. HASEN_MG_RUNG=0
+    // HASEN_MG_SHARED_RUNGS=1,2 HASEN_MG_HEATBATH_RUNGS=0,1,2,3 would otherwise
+    // free the donor after rung 2's last sample and leave rung 3's heatbath a
+    // dangling donor (the same null-handle abort seen 2026-07-09).
+    std::set<int> mg_borrowers = mg_shared_rungs;
+    mg_borrowers.insert(mg_heatbath_rungs.begin(), mg_heatbath_rungs.end());
+    const bool have_shared = !mg_borrowers.empty() && !mg_rungs.empty();
+    const int  donor_rung  = have_shared ? *mg_rungs.begin() : -1;
+    // Highest-index shared rung that is actually EVALUATED.  A skipped sharee
+    // never reaches the in-loop free path, so the donor's deferred free must
+    // key off the last LIVE sharee, not the nominal last one.  -1 => no live
+    // sharee at all, so nothing borrows the donor's MG handle.
+    int last_live_sharee = -1;
+    if (have_shared && !skip_light)
+      for (int r : mg_borrowers)
+        if (!skip_rungs.count(r)) last_live_sharee = std::max(last_live_sharee, r);
+    // Free QUDA solvers for any rungs that will be entirely skipped -- they
+    // will never reach the end-of-last-sample free path in the loop below, so
+    // we release them here to keep peak GPU memory bounded.  EXCEPTION: the MG
+    // donor, if a live sharee still borrows its handle (FORCES_SKIP_RUNGS=0
+    // with HASEN_MG_SHARED_RUNGS=1,2 is exactly this case) -- freeing it here
+    // would leave the sharee a dangling donor (null-handle assert, 2026-07-09).
+    // The in-loop path frees it after the last live sharee instead.
+    // HARD ERROR: skipping the MG donor while a sharee still runs cannot work.
+    // The donor's MG subspace is BUILT lazily, by the donor's own first solve --
+    // so a skipped donor never builds it and the sharee hits
+    // "shared-MG solve before donor built its MG" (QudaMGSchurSolver.h:114,
+    // reproduced 2026-08-11 with FORCES_SKIP_RUNGS=0 + HASEN_MG_SHARED_RUNGS=1,2).
+    // Retaining the donor's solver object does NOT help; only running it does.
+    // Fail here with the fix spelled out rather than mid-run with a raw assert.
+    if (have_shared && skip_rungs.count(donor_rung) && last_live_sharee >= 0) {
+      std::cout << GridLogError
+                << "[FORCES_ONLY] FATAL: FORCES_SKIP_RUNGS skips rung " << donor_rung
+                << ", which is the MG donor (HASEN_MG_RUNG), but shared rung "
+                << last_live_sharee << " is still live and borrows its MG subspace.\n"
+                << "  The donor builds its MG only when it solves, so a skipped donor "
+                << "leaves the sharee a null handle.\n"
+                << "  Fix: either also skip every HASEN_MG_SHARED_RUNGS rung, or point "
+                << "HASEN_MG_RUNG at a rung you are NOT skipping\n"
+                << "  (e.g. skipping 0,1 -> HASEN_MG_RUNG=2 with HASEN_MG_SHARED_RUNGS=3)."
+                << std::endl;
+      assert(0 && "FORCES_SKIP_RUNGS skips the MG donor while a sharee is live");
+    }
+    for (int k : skip_rungs) {
+      if (k >= 0 && k < (int)QudaRungSolver.size() && QudaRungSolver[k]) {
+        QudaRungSolver[k].reset();
+        std::cout << GridLogMessage << "[FORCES_ONLY] freed QUDA solver for skipped rung " << k << std::endl;
+      }
+    }
+#endif
+    Smear.set_Field(Umu);   // smear the fixed config once (deterministic)
+    for (int s = 0; s < nsamp; ++s)
+      for (int i = 0; i < nref; ++i) {
+        if (skip(ForceObs.refs[i].name)) {
+          // Consume the heatbath draw this level would have taken, so the rungs
+          // we DO evaluate see the same noise they would in a full run.
+          if (rng_compensate && skipped_by_new_knobs(ForceObs.refs[i].name))
+            gaussian(pRNG, *rng_eta);
+          continue;
+        }
+        Action<LatticeGaugeField> *act = ForceObs.refs[i].act;
+        double ftime, rtime = 0.0;
+        if (act->is_smeared) {
+          // Smeared pseudofermion / log-det levels: heatbath, then evaluate the
+          // force through the smearing chain rule -- exactly as the integrator's
+          // first P-update does.  refresh() is the heatbath solve -- for a
+          // ratio rung this is the expensive step on a near-critical mass (it
+          // is NOT accelerated by HASEN_MG_RUNG, which only speeds up
+          // deriv()/S(); see QudaMGSchurSolver notes), so time it separately
+          // from deriv() rather than lump both into one number.
+          auto tr0 = std::chrono::steady_clock::now();
+          act->refresh(Smear, sRNG, pRNG);               // heatbath pseudofermions
+          rtime = std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count();
+          auto t0 = std::chrono::steady_clock::now();
+          act->deriv(Smear, force);                      // force incl. smearing chain rule
+          ftime = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        } else {
+          // Unsmeared gauge action: its force depends only on the raw (thin)
+          // links, so evaluate it directly on Umu -- bypassing the heatbath (a
+          // no-op for a gauge action) and the SmearedConfiguration wrapper.
+          // The wrapper path reproducibly HANGS on the standalone gauge eval
+          // after the preceding smeared-fermion evals (leftover smearing/comm
+          // state); the raw call does not stall and returns the same number the
+          // integrator computes (it also feeds get_U(false)==Umu to deriv).
+          auto t0 = std::chrono::steady_clock::now();
+          act->deriv(Umu, force);
+          ftime = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
+        force = PeriodicGimplR::projectForce(force);     // same projection the integrator uses
+        double favg = std::sqrt(norm2(force) / force.Grid()->gSites());
+        double fmax = std::sqrt(maxLocalNorm2(force));
+        acc_avg[i] += favg;
+        acc_max[i] += fmax;
+        acc_time[i] += ftime;
+        acc_refresh[i] += rtime;
+        // Stream each level immediately so a later-level stall can't swallow the
+        // numbers already computed (the end-of-loop summary is otherwise gated
+        // behind every ref, including the FORCES_ONLY gauge eval).
+        std::cout << GridLogMessage << "FORCES_ONLY level " << ForceObs.refs[i].name
+                  << " sample " << s << " avg=" << favg << " max=" << fmax
+                  << " refresh=" << rtime << " time=" << ftime << std::endl;
+#ifdef GRID_HAVE_QUDA
+        // FORCES_ONLY is a ONE-SHOT diagnostic (single heatbath+force per rung,
+        // no MD loop) -- unlike the real HMC path, nothing revisits this rung's
+        // solver again after its last sample, so its GPU memory (gauge/clover
+        // copies, and for MG the coarse-grid + null-vector state) can be freed
+        // immediately rather than held for the rest of the program. This caps
+        // peak GPU memory at ~1 QUDA-routed rung's worth instead of accumulating
+        // one per rung -- avoids the OOM seen routing all 4 rungs through
+        // QUDA/MG simultaneously at 48^3. Real HMC trajectories must NOT do
+        // this (they reuse the same solver every MD step, which is the whole
+        // point of amortizing MG's setup cost) -- this code path only runs
+        // inside the FORCES_ONLY block, never in the trajectory/integrator path.
+        if (s == nsamp - 1 && ForceObs.refs[i].name.rfind("PF", 0) == 0) {
+          int k = std::atoi(ForceObs.refs[i].name.c_str() + 2);
+          auto free_rung = [&](int r) {
+            if (r >= 0 && r < (int)QudaRungSolver.size() && QudaRungSolver[r]) {
+              QudaRungSolver[r].reset();
+              std::cout << GridLogMessage << "[FORCES_ONLY] freed QUDA solver for rung " << r << std::endl;
+            }
+          };
+          // Shared-MG: every sharee borrows the donor's MG handle, so the
+          // donor solver must outlive the highest-index sharee's final
+          // sample -- freeing it after its OWN last sample (the pre-shared
+          // behavior) left later sharees a dangling donor (null-handle
+          // assert, 2026-07-09).  Defer the donor's free to the last
+          // sharee; everything else frees as before.  No memory-cap change:
+          // the donor is alive through every earlier sweep regardless.
+          // have_shared / donor_rung / last_live_sharee are computed once before
+          // the sample loop (see the skipped-rung free block above).
+          if (have_shared && k == donor_rung && k < last_live_sharee) {
+            // live sharees still pending in this final sweep -- keep the donor
+          } else {
+            free_rung(k);
+            if (have_shared && k == last_live_sharee) free_rung(donor_rung);
+          }
+        }
+#endif
+      }
+    auto emit = [&](const char *tag, std::vector<double> &acc) {
+      std::cout << GridLogMessage << "FORCES_ONLY samples=" << nsamp << " " << tag << ":";
+      for (int i = 0; i < nref; ++i)
+        if (!skip(ForceObs.refs[i].name))
+          std::cout << " " << ForceObs.refs[i].name << "=" << acc[i] / nsamp;
+      std::cout << std::endl;
+    };
+    emit("avg", acc_avg);
+    emit("max", acc_max);
+    emit("refresh", acc_refresh);
+    emit("time", acc_time);
+    Grid_finalize();
+    return 0;
+  }
+
+  // ── HMC ──────────────────────────────────────────────────────────────────
+  // INTEGRATOR env var: "MinimumNorm2" (default, 2nd order) or "ForceGradient"
+  // (4th order -- the equivalent of Chroma's LCM_STS_FORCE_GRAD, tolerating
+  // ~2-3x larger steps at the same acceptance).  Same convention as
+  // gen_qcd_cfgs_2plus1.cc.
+  std::string integrator_name = "MinimumNorm2";
+  if (const char *env = std::getenv("INTEGRATOR"); env && *env)
+    integrator_name = env;
+  std::cout << GridLogMessage << "INTEGRATOR=" << integrator_name << std::endl;
+  IntegratorParameters MD;
+  MD.name = integrator_name; MD.MDsteps = mdsteps;
+  // TRAJL has no default and is validated at startup (see the mandatory check
+  // above), so it is guaranteed present here.
+  MD.trajL = std::atof(std::getenv("TRAJL"));
+
+  // NoMetropolisUntil: default 0 (chroma-style Metropolis-from-trajectory-0);
+  // override via NO_METROP env var to skip accept/reject for the first N
+  // trajectories -- useful for inspecting raw dH/force behaviour without the
+  // gauge reverting on a reject (same convention as gen_qcd_cfgs_2plus1.cc).
+  int no_metrop = 0;
+  if (const char *nm = std::getenv("NO_METROP"); nm && *nm) no_metrop = std::atoi(nm);
+  std::cout << GridLogMessage << "NoMetropolisUntil=" << no_metrop << std::endl;
+
+  HMCparameters HMCp;
+  // StartTrajectory sets the numbering the checkpointer saves under (evolve
+  // saves traj+1): 0 unless CKPT_START_TRAJ (fresh numbered stream) or
+  // CKPT_RESUME_TRAJ (continue at n+1) was given.
+  HMCp.StartTrajectory    = ckpt_start;
+  HMCp.Trajectories       = n_traj;
+  HMCp.NoMetropolisUntil  = no_metrop;
+  HMCp.MetropolisTest     = true;
+  HMCp.PerformRandomShift = false;
+  HMCp.StartingType       = "ColdStart";
+  HMCp.MD                 = MD;
+
+  // Per-trajectory gauge observables (plaquette + Polyakov loop) — Grid's stock
+  // loggers. Read-only gauge reductions: draw no RNG, mutate nothing, ~ms cost.
+  PlaquetteLogger<PeriodicGimplR> plaqLog;
+  PolyakovLogger<PeriodicGimplR>  polyLog;
+  std::vector<HmcObservable<LatticeGaugeField> *> Obs = {&ForceObs, &plaqLog, &polyLog};
+  // Checkpointer runs last so the per-trajectory measurement lines land in the
+  // log before the "Written ILDG Configuration" lines.
+  if (Ckpt) Obs.push_back(Ckpt.get());
+
+  // Branch on integrator.  Both types compiled, chosen at runtime (mirrors
+  // gen_qcd_cfgs_2plus1.cc).
+  if (integrator_name == "ForceGradient") {
+    typedef ForceGradient<PeriodicGimplR,
+                          SmearedConfiguration<PeriodicGimplR>, Reps> IntT;
+    IntT MDyn(&Grid_, MD, Aset, Smear);
+    HybridMonteCarlo<IntT> HMC(HMCp, MDyn, sRNG, pRNG, Obs, Umu);
+    HMC.evolve();
+  } else {
+    typedef MinimumNorm2<PeriodicGimplR,
+                         SmearedConfiguration<PeriodicGimplR>, Reps> IntT;
+    IntT MDyn(&Grid_, MD, Aset, Smear);
+    HybridMonteCarlo<IntT> HMC(HMCp, MDyn, sRNG, pRNG, Obs, Umu);
+    HMC.evolve();
+  }
+
+  std::cout << GridLogMessage << "Hasenbusch tuning run complete." << std::endl;
+  Grid_finalize();
+  return 0;
+}
