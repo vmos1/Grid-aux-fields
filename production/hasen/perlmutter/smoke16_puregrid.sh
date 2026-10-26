@@ -64,7 +64,7 @@
 # =============================================================================
 set -o pipefail
 
-BASE=/global/cfs/cdirs/m4599/Users/vayyar/grid_qcd
+BASE=${BASE:-/global/cfs/cdirs/m4599/Users/vayyar/grid_qcd}   # workspace holding data/ (and runs/ unless RUNS_DIR is set)
 WORKFLOW=$BASE/grid-lqcd-workflow
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -100,7 +100,8 @@ JOB_STATE=$(squeue -h -j "$SLURM_JOB_ID" -o %T 2>/dev/null | head -1)
 # binary dies with libcudart.so.13 / libmpfr.so.4, exit 127 (machines/perlmutter.md,
 # "Build and runtime environment"; _SUM.md perlmutter-ops).
 # shellcheck source=/dev/null
-source "$WORKFLOW/machines/perlmutter.sh" || die "sourcing $WORKFLOW/machines/perlmutter.sh failed"
+ENV_SCRIPT=${ENV_SCRIPT:-$WORKFLOW/machines/perlmutter.sh}
+source "$ENV_SCRIPT" || die "sourcing $ENV_SCRIPT failed"
 set -u
 
 LDD_OUT=$(ldd "$BIN" 2>&1) || die "ldd failed on $BIN: $LDD_OUT"
@@ -159,7 +160,7 @@ done
 # binary's params.h (include/params.h, identical to Grid-TXQCD/production/params.h)
 # nor a future source default can differ between the two runs.
 export LATT=16.16.16.48                                   # include/params.h lattice_size()
-export IMPORT_CFG=$BASE/data/cl3_16_48_b6p1_m0p2450_a_cfg_11100.lime   # 16^3 recipes; ILDG, 113 MB
+export IMPORT_CFG=${CFG_16:-$BASE/data/cl3_16_48_b6p1_m0p2450_a_cfg_11100.lime}   # 16^3 recipes; ILDG, 113 MB
 [ -f "$IMPORT_CFG" ] || die "starting configuration not found: $IMPORT_CFG"
 export BETA=6.1                                           # include/params.h
 export CSW=1.24930970916466                               # include/params.h
@@ -276,7 +277,8 @@ GRID_ARGS=(--grid "$LATT" --mpi "$MPI_GEOM" --accelerator-threads 8 --shm 2048 -
 
 # ---- 8. Run directory (refuse to overwrite) -----------------------------------
 DATE_TAG=$(date +%Y_%-m_%-d)                              # unpadded, runs/ convention
-RUN_DIR=$BASE/runs/${DATE_TAG}_${RUN}
+RUNS_DIR=${RUNS_DIR:-$BASE/runs}
+RUN_DIR=$RUNS_DIR/${DATE_TAG}_${RUN}
 [ -e "$RUN_DIR" ] && die "run directory already exists, refusing to overwrite: $RUN_DIR"
 mkdir "$RUN_DIR" || die "cannot create $RUN_DIR"
 LOG=$RUN_DIR/hmc.log

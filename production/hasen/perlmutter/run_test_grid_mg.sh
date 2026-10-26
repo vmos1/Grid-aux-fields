@@ -24,7 +24,8 @@ MPI_GEOM=${MPI_GEOM:-1.1.2.2}
 LATT=${LATT:-16.16.16.48}
 NTASKS=4
 
-source "$WORKFLOW/machines/perlmutter.sh"
+ENV_SCRIPT=${ENV_SCRIPT:-$WORKFLOW/machines/perlmutter.sh}
+source "$ENV_SCRIPT"
 [ "$(ldd "$BIN" | grep -c 'not found')" -eq 0 ] || die "ldd reports missing libraries (source machines/perlmutter.sh?)"
 ldd "$BIN" | grep -qi quda && die "binary links QUDA; this is the pure-Grid test"
 
@@ -34,7 +35,8 @@ export MPICH_RDMA_ENABLED_CUDA=0
 export MPICH_OFI_NIC_POLICY=GPU
 
 DATE_TAG=$(date +%Y_%-m_%-d)
-RUN_DIR=$BASE/runs/${DATE_TAG}_${RUN}
+RUNS_DIR=${RUNS_DIR:-$BASE/runs}
+RUN_DIR=$RUNS_DIR/${DATE_TAG}_${RUN}
 [ -e "$RUN_DIR" ] && die "run directory already exists, refusing to overwrite: $RUN_DIR"
 mkdir "$RUN_DIR" || die "cannot create $RUN_DIR"
 LOG=$RUN_DIR/test.log
