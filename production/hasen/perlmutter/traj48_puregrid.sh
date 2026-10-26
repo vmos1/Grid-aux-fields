@@ -95,7 +95,7 @@
 # =============================================================================
 set -o pipefail
 
-BASE=/global/cfs/cdirs/m4599/Users/vayyar/grid_qcd
+BASE=${BASE:-/global/cfs/cdirs/m4599/Users/vayyar/grid_qcd}   # workspace holding data/ (and runs/ unless RUNS_DIR is set)
 WORKFLOW=$BASE/grid-lqcd-workflow
 SELF=$(readlink -f "$0")
 
@@ -187,7 +187,7 @@ TIMEOUT_MIN=${TIMEOUT_MIN:-210}
 DEVICE_MEM_MB=${DEVICE_MEM_MB:-8000}
 GPU_MON_MS=${GPU_MON_MS:-2000}
 VERBOSE_MEM_REQ=${INTEGRATOR_VERBOSE_MEM:-0}
-CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-${PSCRATCH:+$PSCRATCH/grid_pure_hmc/ckpt}}
+CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-${PSCRATCH:+$PSCRATCH/grid_txqcd/ckpt}}
 if [ -z "${HASEN_GRID_MG_RUNGS+x}" ]; then HASEN_GRID_MG_RUNGS=0,1,2; fi
 if [ -z "${HASEN_GRID_MG_HEATBATH_RUNGS+x}" ]; then HASEN_GRID_MG_HEATBATH_RUNGS=0,1; fi
 if [ -z "${HASEN_GRID_MIXED_CG_RUNGS+x}" ]; then HASEN_GRID_MIXED_CG_RUNGS=3; fi
@@ -217,7 +217,8 @@ fi
 # binary dies with libcudart.so.13 / libmpfr.so.4, exit 127 (machines/perlmutter.md,
 # "Build and runtime environment"; _SUM.md perlmutter-ops).
 # shellcheck source=/dev/null
-source "$WORKFLOW/machines/perlmutter.sh" || die "sourcing $WORKFLOW/machines/perlmutter.sh failed"
+ENV_SCRIPT=${ENV_SCRIPT:-$WORKFLOW/machines/perlmutter.sh}
+source "$ENV_SCRIPT" || die "sourcing $ENV_SCRIPT failed"
 set -u
 
 LDD_OUT=$(ldd "$BIN" 2>&1) || die "ldd failed on $BIN: $LDD_OUT"
@@ -684,7 +685,8 @@ fi
 # the hybrid chain's "SAME dir, append" resume, nothing is ever written into another run's
 # directory, a replay (RESUME_TRAJ) cannot overwrite the trajectories it replays, and a
 # failed resume is re-run without cleaning anything up.
-RUN_DIR=$BASE/runs/${DATE_TAG}_${RUN}
+RUNS_DIR=${RUNS_DIR:-$BASE/runs}
+RUN_DIR=$RUNS_DIR/${DATE_TAG}_${RUN}
 [ -e "$RUN_DIR" ] && die "run directory already exists, refusing to overwrite: $RUN_DIR"
 if [ "$CHECKPOINT_ROOT" = rundir ]; then
   CKPT_PHYS=$RUN_DIR/ckpt
