@@ -1,8 +1,15 @@
-# Out-of-tree build of the production programs against an existing Grid build,
-# via its grid-config.  Default build directory is ../build (Perlmutter in-tree
-# build of this fork); override on the command line:
+# Build of the production programs against an existing Grid build, via its
+# grid-config.  Default: run in this directory against ../build; override on the
+# command line:
 #   make GRID_BUILD_DIR=../build-gpu gen_dtxqcd_cfgs
+# Out of source: run make in an output directory with this Makefile and SRCDIR
+# pointing back here; the binaries are written to the output directory:
+#   make -C <out> -f <tree>/production/Makefile SRCDIR=<tree>/production \
+#        GRID_BUILD_DIR=<grid build> gen_dtxqcd_cfgs
 # Pure Grid: there is no QUDA backend in this tree.
+SRCDIR ?= .
+vpath %.cc $(SRCDIR)
+vpath %.h  $(SRCDIR)
 GRID_BUILD_DIR ?= ../build
 GRID_CONFIG = $(GRID_BUILD_DIR)/grid-config
 CXX      = $(shell $(GRID_CONFIG) --cxx)
@@ -13,7 +20,7 @@ BREW_PREFIX ?= /opt/homebrew/opt
 # The source tree and the build directory come BEFORE grid-config's flags: those
 # carry -I<install prefix>/include, and an older `make install` there would
 # otherwise shadow the tree's headers (the aux-field include in ActionCore.h).
-CXXFLAGS = -I.. -I$(GRID_BUILD_DIR)/Grid $(shell $(GRID_CONFIG) --cxxflags) -I$(BREW_PREFIX)/openssl@3/include
+CXXFLAGS = -I$(SRCDIR)/.. -I$(GRID_BUILD_DIR)/Grid $(shell $(GRID_CONFIG) --cxxflags) -I$(BREW_PREFIX)/openssl@3/include
 LDFLAGS  = -L$(GRID_BUILD_DIR)/Grid $(shell $(GRID_CONFIG) --ldflags) -L$(BREW_PREFIX)/openssl@3/lib
 LIBS     = $(shell $(GRID_CONFIG) --libs)
 
