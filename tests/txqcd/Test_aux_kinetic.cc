@@ -28,7 +28,10 @@ RealD TensorInner(LatticeTField &A, LatticeTField &B) {
   autoView(Bv, B, CpuRead);
   GridBase *grid = A.Grid();
   RealD total = 0.0;
-  thread_for(ss, grid->oSites(), {
+  // Serial over sites, as in the other TXQCD force tests: a thread_for here
+  // added into the shared `total` from every thread without a reduction (a
+  // data race; the result changed from run to run with OMP_NUM_THREADS > 1).
+  for (uint64_t ss = 0; ss < grid->oSites(); ++ss) {
     for (int mu = 0; mu < Nd; ++mu) {
       for (int nu = mu + 1; nu < Nd; ++nu) {
         auto Am = Av[ss]()(mu, nu);
@@ -38,7 +41,7 @@ RealD TensorInner(LatticeTField &A, LatticeTField &B) {
             total += real(Reduce(Am(i, j) * Bm(j, i)));
       }
     }
-  });
+  }
   grid->GlobalSum(total);
   return total;
 }

@@ -862,14 +862,19 @@ class TXQCDWilsonCloverFermionEO {
     }
 
     // Wrap FS_e_/FS_o_ (std::vector<LatticeColourMatrix>) into an std::array.
-    std::array<LatticeColourMatrix, 6> fmn_arr{
-        FS[0], FS[1], FS[2], FS[3], FS[4], FS[5]};
+    // FS_e_/FS_o_ are allocated only when csw != 0 (constructor), so the copy
+    // must be guarded: at csw = 0 FS[0..5] would read past an empty vector
+    // (segfault on the CUDA default path, seen in the csw=0 gate tests).
+    std::unique_ptr<std::array<LatticeColourMatrix, 6>> fmn_arr;
+    if (csw_ != 0.0)
+      fmn_arr.reset(new std::array<LatticeColourMatrix, 6>{
+          FS[0], FS[1], FS[2], FS[3], FS[4], FS[5]});
 
     // Step 1: GPU BuildSiteMatrix → Mfwd_dev.
     TxqcdLogDet::BuildSiteMatrixFromLattice(
         &Mfwd_dev[0], &lex_dev[0], diag_mass_, csw_,
         sigma, pi, s, p, t,
-        (csw_ != 0.0) ? &fmn_arr : nullptr);
+        fmn_arr.get());
 
     // Step 2: copy Mfwd_dev → Mscratch (cuBLAS getrf is in-place; we keep
     // Mfwd_dev intact so MOOEE_CUBLAS's forward gemm still has it).

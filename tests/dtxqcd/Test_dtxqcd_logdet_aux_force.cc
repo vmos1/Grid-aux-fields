@@ -136,6 +136,11 @@ int main(int argc, char **argv) {
   // direction.  1e-7 keeps truncation in the noise floor (CG-free LogDet
   // means no lower limit from solver tol).
   const RealD h    = 5e-8;
+  // The gauge-clover direction needs a LARGER step: at h = 5e-8 the
+  // difference S(+h) - S(-h) is limited by roundoff in |S| (~8e3 at 4.4.4.8),
+  // which gave rel 1.7e-6 there; 5e-6 gives 8e-9 at 4.4.4.8 (h^2 truncation
+  // in this direction is far below tol), while the aux directions keep 5e-8.
+  const RealD h_gauge = 5e-6;
 
   // ---------- csw = 0 -- per-piece breakdown ----------
   DTXQCDLogDetCloverEOAction action(Grid, RBGrid, mass, /*csw=*/0.0);
@@ -215,21 +220,21 @@ int main(int argc, char **argv) {
 
     for (int mu = 0; mu < Nd; ++mu) {
       LatticeColourMatrix Umu  = PeekIndex<LorentzIndex>(Usaved, mu);
-      LatticeColourMatrix expE = expMat(Emu[mu], h, 12);
+      LatticeColourMatrix expE = expMat(Emu[mu], h_gauge, 12);
       PokeIndex<LorentzIndex>(U.U, expE * Umu, mu);
     }
     RealD Sp = action2.S(U);
 
     for (int mu = 0; mu < Nd; ++mu) {
       LatticeColourMatrix Umu  = PeekIndex<LorentzIndex>(Usaved, mu);
-      LatticeColourMatrix expE = expMat(Emu[mu], -h, 12);
+      LatticeColourMatrix expE = expMat(Emu[mu], -h_gauge, 12);
       PokeIndex<LorentzIndex>(U.U, expE * Umu, mu);
     }
     RealD Sm = action2.S(U);
 
     U.U = Usaved;
 
-    RealD fd = (Sp - Sm) / (2.0 * h);
+    RealD fd = (Sp - Sm) / (2.0 * h_gauge);
     check("csw=1.25 gauge clover FD vs analytic", fd, ana, 1e-6);
 
     RealD nU = std::sqrt(norm2(dSdU2.U));
