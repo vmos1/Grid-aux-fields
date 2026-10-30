@@ -181,7 +181,12 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
   // ------------------------------------------------------------------
   void deriv(const DTXQCDField &U, DTXQCDField &dSdU) override {
     dSdU = Zero();
+    double t_eop = usecond();
     auto Dw = MakeEOp(U);
+    t_eop = usecond() - t_eop;
+    if (DTXQCDWilsonCloverFermionEO::EoTiming())
+      std::cout << GridLogMessage << "[" << action_name()
+                << "] deriv timing: MakeEOp=" << t_eop / 1e3 << " ms" << std::endl;
     DTXQCDMpcOp Mop(Dw);
 
     // ---- Multi-shift solve into Xk[k] = (M^dag M + sigma_k)^{-1} Phi ----
@@ -623,8 +628,14 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
                        const DTXQCDFermionDoubled &src,
                        std::vector<DTXQCDFermionDoubled> &xk) {
     if (MpCgEnabled()) {
+      double t_sp = usecond();
       if (!Dw.SinglePrecEnabled()) Dw.EnableSinglePrec();
       DTXQCDMpcOpF Mop_f(Dw);
+      t_sp = usecond() - t_sp;
+      if (DTXQCDWilsonCloverFermionEO::EoTiming())
+        std::cout << GridLogMessage << "[" << action_name()
+                  << "] solve setup: single-precision operator=" << t_sp / 1e3 << " ms"
+                  << std::endl;
       DTXQCDMultiShiftCGMixedPrec(Mop, Mop_f, poles, tol, src, xk,
                                   param_.MaxIter, MpCgReliableFreq());
     } else {

@@ -335,9 +335,16 @@ class DTXQCDLogDetCloverEOAction : public Action<DTXQCDField> {
   // the O(48^2) force traces stay on host.  Matches deriv_cpu to roundoff.
   void deriv_gpu(const DTXQCDField &U, DTXQCDField &dSdU) {
 #ifdef GRID_CUDA
+    // DTXQCD_EO_TIMING=1: per-phase wall times (timing only).
+    static const bool timing = []() {
+      const char *e = std::getenv("DTXQCD_EO_TIMING");
+      return e && *e && std::atoi(e) != 0;
+    }();
+    double t_l0 = usecond();
     dSdU = Zero();
     EvenLocalAux L;
     ExtractEvenLocalAux(U, L);
+    double t_l1 = usecond();
     const uint64_t Nsite = L.Nsite;
     constexpr int N = kDim48;
     constexpr int N2 = N * N;
@@ -357,6 +364,7 @@ class DTXQCDLogDetCloverEOAction : public Action<DTXQCDField> {
       std::memcpy(&h_fwd[(size_t)idx * N2], M48.data(),
                   (size_t)N2 * sizeof(std::complex<double>));
     });
+    double t_l2 = usecond();
     DtxqcdBlas::BatchedInverse48::Ensure(Nsite, /*need_inv=*/true);
     acceleratorCopyToDevice((void *)h_fwd.data(),
                             (void *)&DtxqcdBlas::BatchedInverse48::M_fwd[0],
@@ -366,6 +374,7 @@ class DTXQCDLogDetCloverEOAction : public Action<DTXQCDField> {
     acceleratorCopyFromDevice((void *)&DtxqcdBlas::BatchedInverse48::M_inv[0],
                               (void *)h_inv.data(),
                               (size_t)Nsite * N2 * sizeof(ComplexD));
+    double t_l3 = usecond();
 
     std::vector<SigSobj> fsig(Nsite);
     std::vector<PiSobj>  fpi(Nsite);
@@ -405,6 +414,7 @@ class DTXQCDLogDetCloverEOAction : public Action<DTXQCDField> {
       fss[idx] = s_force;
       fpp[idx] = p_force;
     });
+    double t_l4 = usecond();
 
     PackEvenToFull(fsig, dSdU.sigma);
     PackEvenToFull(fpi,  dSdU.pi);
@@ -422,6 +432,7 @@ class DTXQCDLogDetCloverEOAction : public Action<DTXQCDField> {
         PackEvenToFull(fcs[k], clover_sigma_full[k]);
       }
     }
+    double t_l5 = usecond();
 
     if (csw_ != 0.0) {
       typedef WilsonImplR Impl;
@@ -466,6 +477,15 @@ class DTXQCDLogDetCloverEOAction : public Action<DTXQCDField> {
     dSdU.s     = ComplexD(0.5, 0.0) * dSdU.s;
     dSdU.p     = ComplexD(0.5, 0.0) * dSdU.p;
     dSdU.U     = ComplexD(0.5, 0.0) * dSdU.U;
+    double t_l6 = usecond();
+    if (timing)
+      std::cout << GridLogMessage << "[DTXQCDLogDetCloverEOAction] deriv timing (ms): extract="
+                << (t_l1 - t_l0) / 1e3 << " build=" << (t_l2 - t_l1) / 1e3
+                << " h2d+invert+d2h=" << (t_l3 - t_l2) / 1e3
+                << " host-force-kernel=" << (t_l4 - t_l3) / 1e3
+                << " pack=" << (t_l5 - t_l4) / 1e3
+                << " clover-chain=" << (t_l6 - t_l5) / 1e3
+                << " total=" << (t_l6 - t_l0) / 1e3 << std::endl;
 #else
     deriv_cpu(U, dSdU);  // never reached: dispatch forces CPU on non-CUDA
 #endif
