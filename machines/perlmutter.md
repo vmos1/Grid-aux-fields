@@ -102,12 +102,19 @@ Updated on 2026-10-29 10:23 CDT · perlmutter
 
 ## Known failures on this machine
 
-Updated on 2026-10-28 11:27 CDT · perlmutter
+Updated on 2026-10-29 17:32 CDT · perlmutter
 
-- `Test_aux_kinetic` (finite-difference value not reproducible on GPU) and
-  `Test_dtxqcd_rational_aux_force` (hangs after its Remez fit) fail in every tree here,
-  including his branch as committed; not regressions. Five TXQCD tests of his branch
-  segfault at exit after complete output; the fork's copies behave the same.
+- Since `d01a54b5` all of the collaborator's gate tests pass on these A100s except
+  `Test_dtxqcd_rational_aux_force`: at its tol 1e-12 every multishift solve runs into the
+  20000-iteration cap (~110 s each at 4⁴), so the test needs over an hour; it logs
+  "did not converge" each time. Not a hang. His branch as committed also fails
+  `Test_aux_kinetic`, `Test_dtxqcd_logdet_aux_force` (at `--grid 4.4.4.8`) and crashes in six
+  TXQCD tests (csw=0 GPU precompute); causes in
+  `__docs/2026_10_29_collaborator_test_failures_diagnosed.md`.
+- Never run `make -n -B` in the build tree to read compile commands: GNU make remakes its
+  Makefiles even in dry-run mode, and `-B` makes it re-run autotools and configure (it did,
+  2026-10-29, in a shell without the module environment). Re-run
+  `workflow/build_grid_fork.sh configure` if it happens.
 
 ## Tools on the login node
 

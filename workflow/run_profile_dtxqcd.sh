@@ -38,8 +38,10 @@ printf '%s\n' '#!/bin/bash' 'export CUDA_VISIBLE_DEVICES=$SLURM_LOCALID' 'exec n
 chmod +x "$sel"
 SRUN=(srun --jobid="$SLURM_JOB_ID" -N 1 -n 4 --ntasks-per-node=4 --gpus-per-task=1 --cpus-per-task=32 --cpu-bind=cores --gpu-bind=none --export=ALL --chdir="$DIR")
 
-# run_dtxqcd_gencfgs.sh defaults (QUDA knobs gone in the fork), then the caller's overrides.
-GEN_ENV=(LATT="$LATT" LAMBDA_DTXQCD=10.0 MASS_LIGHT_DTXQCD=-0.245 CSW=1.24930970916466
+# run_dtxqcd_gencfgs.sh defaults (QUDA knobs gone in the fork), plus our validated
+# optimisations (aux-optim: DTXQCD_LAZY_SMEAR=1, bit-identical, 2026-10-30), then the
+# caller's overrides (pass DTXQCD_LAZY_SMEAR=0 for the eager path).
+GEN_ENV=(LATT="$LATT" DTXQCD_LAZY_SMEAR=1 LAMBDA_DTXQCD=10.0 MASS_LIGHT_DTXQCD=-0.245 CSW=1.24930970916466
   STOUT_NSMEAR=1 STOUT_RHO=0.125 ADD_STRANGE=0 AUX_INIT_AUTO=1 RAT_AUTO_HI=1
   DTXQCD_PRECOMPUTE_GPU=1 DTXQCD_LOGDET_S_GPU=1 DTXQCD_LOGDET_GPU=1
   DTXQCD_MOOEEINV_CUBLAS=1 DTXQCD_MOOEE_CUBLAS=1 DTXQCD_MOOEE_FWDCACHE=1
