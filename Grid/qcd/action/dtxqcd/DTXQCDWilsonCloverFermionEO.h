@@ -266,6 +266,19 @@ class DTXQCDWilsonCloverFermionEO {
     return on;
   }
 
+  // DTXQCD_PACK_ON_DEVICE (default 1, needs the GPU build and
+  // ReuseSiteMatrices): fill the SIMD caches inv_e_/o_ and fwd_e_/o_ on the
+  // device straight from the column-major batched matrices, instead of copying
+  // the inverse to the host, unpacking it and vectorizing on the host.  A pure
+  // permutation of the same values: bit-identical to =0.
+  static bool PackOnDevice() {
+    static const bool on = []() {
+      const char *e = std::getenv("DTXQCD_PACK_ON_DEVICE");
+      return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
+  }
+
   // DTXQCD_EO_TIMING=1: print per-phase wall times of ImportFields (the per-site
   // 48x48 cache builds) on every call.  Timing only; no effect on any result.
   static bool EoTiming() {
@@ -474,6 +487,43 @@ class DTXQCDWilsonCloverFermionEO {
     }
   }
 
+#ifdef GRID_CUDA
+  // Device table lex_of[oidx*Nsimd + lane] = local lex index of that (outer
+  // site, lane) of grid, in the order unvectorizeToLexOrdArray and
+  // vectorizeFromLexOrdArray use (same loop as theirs).  Independent of the
+  // checkerboard parity; built once per grid, for PackColMajorToSimd.
+  const uint64_t *LexOfOuterLane(GridBase *grid) {
+    constexpr int nsimd = SiteInvMat::Nsimd();
+    const uint64_t osites = grid->oSites();
+    if (lexmap_grid_ != grid || lexmap_.size() != osites * nsimd) {
+      const int ndim = grid->Nd();
+      std::vector<Coordinate> icoor(nsimd);
+      for (int lane = 0; lane < nsimd; ++lane) {
+        icoor[lane].resize(ndim);
+        grid->iCoorFromIindex(icoor[lane], lane);
+      }
+      std::vector<uint64_t> h(osites * nsimd);
+      thread_for(oidx, osites, {
+        Coordinate ocoor(ndim);
+        Coordinate lcoor(ndim);
+        grid->oCoorFromOindex(ocoor, oidx);
+        for (int lane = 0; lane < nsimd; ++lane) {
+          for (int mu = 0; mu < ndim; ++mu)
+            lcoor[mu] = ocoor[mu] + grid->_rdimensions[mu] * icoor[lane][mu];
+          int lex;
+          Lexicographic::IndexFromCoor(lcoor, lex, grid->_ldimensions);
+          h[oidx * nsimd + lane] = (uint64_t)lex;
+        }
+      });
+      lexmap_.resize(h.size());
+      acceleratorCopyToDevice((void *)h.data(), (void *)&lexmap_[0],
+                              h.size() * sizeof(uint64_t));
+      lexmap_grid_ = grid;
+    }
+    return &lexmap_[0];
+  }
+#endif
+
   // Build the per-CB 48x48 Mooee^{-1} cache.  Iterates sites of the chosen
   // CB, assembles M48 from the full-grid aux + clover at that site (Eigen),
   // computes M48^{-1} via partialPivLu, and pokes the result into the
@@ -552,11 +602,6 @@ class DTXQCDWilsonCloverFermionEO {
       DtxqcdAssembleDoubled48(M_upper, M_lower, M_off, M48);
     };
 
-    std::vector<SmatSobj> sobjs(Nsite);
-    // Forward site matrices for the forward SIMD cache (fwd != nullptr only),
-    // filled from the same M48 as the inverse.
-    std::vector<SmatSobj> fwd_sobjs(fwd ? Nsite : 0);
-
     // Gate the per-site 48x48 inversion -- the dominant cost -- onto one batched
     // cuBLAS getrf+getri (DTXQCD_PRECOMPUTE_GPU, default ON on CUDA).  CPU
     // reference keeps the per-site Eigen inverse.  Both fill sobjs identically.
@@ -571,6 +616,16 @@ class DTXQCDWilsonCloverFermionEO {
     }();
     // Device forward/inverse copies straight from the batched-inverse buffers.
     const bool reuse_dev = use_gpu && ReuseSiteMatrices();
+    // SIMD caches packed on the device from those buffers (no host copies).
+    const bool pack_dev  = reuse_dev && PackOnDevice();
+    // inv_lex is read only by the Eigen fallback of ApplyInverseLex.
+    const bool need_lex  = !ReuseSiteMatrices() || !UseMooeeInvCublas();
+
+    // Host copies of the inverse (lex order): for the host vectorize, the
+    // legacy inv_dev upload and inv_lex.  Forward copies for the host
+    // vectorize of the forward cache (fwd != nullptr only).
+    std::vector<SmatSobj> sobjs((!pack_dev || need_lex) ? Nsite : 0);
+    std::vector<SmatSobj> fwd_sobjs((fwd && !pack_dev) ? Nsite : 0);
 
 #ifdef GRID_CUDA
     if (use_gpu) {
@@ -581,7 +636,7 @@ class DTXQCDWilsonCloverFermionEO {
         build_M48(idx, M48);                   // Eigen storage is column-major
         std::memcpy(&h_fwd[(size_t)idx * N2], M48.data(),
                     (size_t)N2 * sizeof(std::complex<double>));
-        if (fwd) {
+        if (fwd && !pack_dev) {
           SmatSobj sobj;
           sobj = Zero();
           for (int r = 0; r < N; ++r)
@@ -614,20 +669,24 @@ class DTXQCDWilsonCloverFermionEO {
                                       (void *)&inv_dev[0],
                                       (size_t)Nsite * N2 * sizeof(ComplexD));
       }
-      std::vector<std::complex<double>> h_inv((size_t)Nsite * N2);
-      acceleratorCopyFromDevice((void *)&DtxqcdBlas::BatchedInverse48::M_inv[0],
-                                (void *)h_inv.data(),
-                                (size_t)Nsite * N2 * sizeof(ComplexD));
-      t_c_gpu = usecond();
-      thread_for(idx, Nsite, {
-        const std::complex<double> *src = &h_inv[(size_t)idx * N2];
-        SmatSobj sobj;
-        sobj = Zero();
-        for (int r = 0; r < N; ++r)
-          for (int c = 0; c < N; ++c)
-            sobj()()(r, c) = src[(size_t)c * N + r];  // column-major -> (r,c)
-        sobjs[idx] = sobj;
-      });
+      if (!sobjs.empty()) {
+        std::vector<std::complex<double>> h_inv((size_t)Nsite * N2);
+        acceleratorCopyFromDevice((void *)&DtxqcdBlas::BatchedInverse48::M_inv[0],
+                                  (void *)h_inv.data(),
+                                  (size_t)Nsite * N2 * sizeof(ComplexD));
+        t_c_gpu = usecond();
+        thread_for(idx, Nsite, {
+          const std::complex<double> *src = &h_inv[(size_t)idx * N2];
+          SmatSobj sobj;
+          sobj = Zero();
+          for (int r = 0; r < N; ++r)
+            for (int c = 0; c < N; ++c)
+              sobj()()(r, c) = src[(size_t)c * N + r];  // column-major -> (r,c)
+          sobjs[idx] = sobj;
+        });
+      } else {
+        t_c_gpu = usecond();
+      }
       t_c_unpack = usecond();
     } else
 #endif
@@ -708,16 +767,32 @@ class DTXQCDWilsonCloverFermionEO {
     // Pack the local lex-ordered inverses into the SIMD cache (inverse of the
     // unvectorize above) and the Eigen multi-RHS cache.  inv_lex[s] aligns with
     // the fermion lex order in ApplyInverseLex (same grid + CB).
-    vectorizeFromLexOrdArray(sobjs, inv);
-    if (fwd) {  // as BuildForwardSimdCB
-      *fwd = Zero();
-      fwd->Checkerboard() = cb;
-      vectorizeFromLexOrdArray(fwd_sobjs, *fwd);
-      fwd->Checkerboard() = cb;
+#ifdef GRID_CUDA
+    if (pack_dev) {
+      // Same placement as vectorizeFromLexOrdArray, done on the device from
+      // M_inv (getri output) and fwd_dev (copy of M_fwd before getrf).
+      const uint64_t *lex_of = LexOfOuterLane(inv.Grid());
+      PackColMajorToSimd(&DtxqcdBlas::BatchedInverse48::M_inv[0], lex_of, inv);
+      inv.Checkerboard() = cb;
+      if (fwd) {
+        deviceVector<ComplexD> &fwd_dev = (cb == Even) ? fwd_dev_e_ : fwd_dev_o_;
+        PackColMajorToSimd(&fwd_dev[0], lex_of, *fwd);
+        fwd->Checkerboard() = cb;
+      }
+    } else
+#endif
+    {
+      vectorizeFromLexOrdArray(sobjs, inv);
+      if (fwd) {  // as BuildForwardSimdCB
+        *fwd = Zero();
+        fwd->Checkerboard() = cb;
+        vectorizeFromLexOrdArray(fwd_sobjs, *fwd);
+        fwd->Checkerboard() = cb;
+      }
     }
     double t_c_vec = usecond();
     inv_lex.clear();
-    if (!ReuseSiteMatrices() || !UseMooeeInvCublas()) {
+    if (need_lex) {
       inv_lex.resize(Nsite);
       thread_for(s, Nsite, {
         Eigen::MatrixXcd M(kDim48, kDim48);
@@ -821,6 +896,33 @@ class DTXQCDWilsonCloverFermionEO {
   // Public because nvcc (--expt-extended-lambda) forbids an extended
   // __host__ __device__ lambda (the accelerator_for below) inside a private
   // or protected member function.
+  //
+  // Device version of vectorizeFromLexOrdArray for the 48x48 caches: lane l of
+  // out[ss], element (r,c), takes src[lex*48*48 + c*48 + r] (column-major per
+  // site, as the batched cuBLAS buffers hold them) with lex = lex_of[ss*Nsimd+l].
+  // Writes every element of every lane; a pure copy.  CUDA only: one GPU
+  // thread per lane (a host thread_for would fill lane 0 only).
+#ifdef GRID_CUDA
+  static void PackColMajorToSimd(const ComplexD *src, const uint64_t *lex_of,
+                                 InvField &out) {
+    constexpr int N = kDim48, N2 = N * N;
+    constexpr int Nsimd = SiteInvMat::Nsimd();
+    typedef typename SiteInvMat::scalar_type Scalar;
+    static_assert(sizeof(Scalar) == sizeof(ComplexD), "48x48 cache scalar is not ComplexD");
+    const uint64_t osites = out.Grid()->oSites();
+    autoView(out_v, out, AcceleratorWrite);
+    accelerator_for(i, osites * N2, Nsimd, {
+      const uint64_t ss = i / N2;
+      const int e = (int)(i % N2);
+      const int r = e / N, c = e % N;
+      const int l = acceleratorSIMTlane(Nsimd);
+      const uint64_t lex = lex_of[ss * Nsimd + l];
+      Scalar *p = (Scalar *)&out_v[ss]()()(r, c);  // the Nsimd lanes of one element
+      p[l] = *(const Scalar *)&src[lex * N2 + (uint64_t)c * N + r];
+    });
+  }
+#endif
+
   // PR 5': forward Mooee via per-site SIMD against pre-built fwd_e_/o_ cache.
   // Byte-for-byte mirror of ApplyInverseSimd but reads fwd instead of inv.
   // Requires sp_enabled_ (fwd cache must be built; caller gates this).
@@ -1498,6 +1600,9 @@ class DTXQCDWilsonCloverFermionEO {
   inline static uint64_t cublas_fwd_ptrs_gen_e_{0}, cublas_fwd_ptrs_gen_o_{0};
   inline static int      cublas_fwd_ptrs_NRHS_e_{0}, cublas_fwd_ptrs_NRHS_o_{0};
   inline static uint64_t cublas_fwd_ptrs_Nsite_e_{0}, cublas_fwd_ptrs_Nsite_o_{0};
+  // LexOfOuterLane: per-(outer site, lane) local lex index of lexmap_grid_.
+  deviceVector<uint64_t> lexmap_;
+  GridBase *lexmap_grid_{nullptr};
 #endif
 
   DtxqcdSpinMatrices spin_;
