@@ -50,8 +50,9 @@ export LD_LIBRARY_PATH="${CRAY_LD_LIBRARY_PATH:-}:${LD_LIBRARY_PATH:-}"
 export GRID_MPFR_PREFIX=/opt/cray/pe/gcc/mpfr/3.1.4
 export LD_LIBRARY_PATH="${GRID_MPFR_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 
-# Cluster-specific dependency paths
-export CLIME_ROOT=/global/cfs/cdirs/m4599/Users/vayyar/grid_qcd/lime-install
+# Cluster-specific dependency paths. The default LIME install is readable by m4599
+# members only; anyone else sets CLIME_ROOT to their own c-lime install first.
+export CLIME_ROOT=${CLIME_ROOT:-/global/cfs/cdirs/m4599/Users/vayyar/grid_qcd/lime-install}
 export CUDA_ARCH=sm_80
 
 # Python: the repo's own uv environment (pyproject.toml + uv.lock at the repo root), not the
