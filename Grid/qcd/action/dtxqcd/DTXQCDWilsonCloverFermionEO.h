@@ -315,6 +315,17 @@ class DTXQCDWilsonCloverFermionEO {
     return on;
   }
 
+  // DTXQCD_INVN_DEVICE_PACK (default 1, with DTXQCD_MOOEEINV_CUBLAS): pack and
+  // unpack the multi-RHS Mooee^{-1} buffers on the device
+  // (ApplyInverseLexDevice).  =0 restores the host packing.
+  static bool InvNDevicePack() {
+    static const bool on = []() {
+      const char *e = std::getenv("DTXQCD_INVN_DEVICE_PACK");
+      return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
+  }
+
   // DTXQCD_PACK_ON_DEVICE (default 1, needs the GPU build and
   // ReuseSiteMatrices): fill the SIMD caches inv_e_/o_ and fwd_e_/o_ on the
   // device straight from the column-major batched matrices, instead of copying
@@ -970,6 +981,52 @@ class DTXQCDWilsonCloverFermionEO {
       p[l] = *(const Scalar *)&src[lex * N2 + (uint64_t)c * N + r];
     });
   }
+
+  // Device pack / unpack of one doubled fermion to / from the flat
+  // column-major multi-RHS buffer of ApplyInverseLex: element (local lex site,
+  // rhs k, row r) at buf[(lex*NRHS + k)*48 + r], rows 0..23 upper (a, alpha,
+  // i), 24..47 lower -- the placement of its host loops.  One thread per
+  // (outer site, row, SIMD lane); data movement only.
+  static void PackFermionToFlat(const Field &in, int k, int NRHS,
+                                const uint64_t *lex_of, ComplexD *buf) {
+    constexpr int N = kDim48, N24 = kDim24, NsNc = Ns * Nc;
+    constexpr int Nsimd = LatticeFermion::vector_object::Nsimd();
+    typedef typename LatticeFermion::vector_object::scalar_type Scalar;
+    const uint64_t osites = in.upper.f[0].Grid()->oSites();
+    auto up_v = MakeFermViewsRead<DtxqcdNf>(in.upper, std::make_index_sequence<DtxqcdNf>{});
+    auto lo_v = MakeFermViewsRead<DtxqcdNf>(in.lower, std::make_index_sequence<DtxqcdNf>{});
+    accelerator_for(i, osites * N, Nsimd, {
+      const uint64_t ss = i / N;
+      const int r = (int)(i % N);
+      const int r24 = r % N24, a = r24 / NsNc, alpha = (r24 % NsNc) / Nc, ic = r24 % Nc;
+      const int l = acceleratorSIMTlane(Nsimd);
+      const uint64_t lex = lex_of[ss * Nsimd + l];
+      const Scalar *p = (r < N24) ? (const Scalar *)&up_v[a][ss]()(alpha)(ic)
+                                  : (const Scalar *)&lo_v[a][ss]()(alpha)(ic);
+      buf[(lex * NRHS + k) * N + r] = *(const ComplexD *)&p[l];
+    });
+    for (int a = 0; a < DtxqcdNf; ++a) { up_v[a].ViewClose(); lo_v[a].ViewClose(); }
+  }
+  static void UnpackFlatToFermion(const ComplexD *buf, int k, int NRHS,
+                                  const uint64_t *lex_of, Field &out) {
+    constexpr int N = kDim48, N24 = kDim24, NsNc = Ns * Nc;
+    constexpr int Nsimd = LatticeFermion::vector_object::Nsimd();
+    typedef typename LatticeFermion::vector_object::scalar_type Scalar;
+    const uint64_t osites = out.upper.f[0].Grid()->oSites();
+    auto up_v = MakeFermViewsWrite<DtxqcdNf>(out.upper, std::make_index_sequence<DtxqcdNf>{});
+    auto lo_v = MakeFermViewsWrite<DtxqcdNf>(out.lower, std::make_index_sequence<DtxqcdNf>{});
+    accelerator_for(i, osites * N, Nsimd, {
+      const uint64_t ss = i / N;
+      const int r = (int)(i % N);
+      const int r24 = r % N24, a = r24 / NsNc, alpha = (r24 % NsNc) / Nc, ic = r24 % Nc;
+      const int l = acceleratorSIMTlane(Nsimd);
+      const uint64_t lex = lex_of[ss * Nsimd + l];
+      Scalar *p = (r < N24) ? (Scalar *)&up_v[a][ss]()(alpha)(ic)
+                            : (Scalar *)&lo_v[a][ss]()(alpha)(ic);
+      p[l] = *(const Scalar *)&buf[(lex * NRHS + k) * N + r];
+    });
+    for (int a = 0; a < DtxqcdNf; ++a) { up_v[a].ViewClose(); lo_v[a].ViewClose(); }
+  }
 #endif
 
   // PR 5': forward Mooee via per-site SIMD against pre-built fwd_e_/o_ cache.
@@ -1139,6 +1196,93 @@ class DTXQCDWilsonCloverFermionEO {
   // The dag path is unused on the inside (we provide MooeeInvDagN above as a
   // gamma_5 wrapper), but kept symmetric in case a caller wants the raw
   // adjoint apply.
+#ifdef GRID_CUDA
+  // The DTXQCD_MOOEEINV_CUBLAS path of ApplyInverseLex with its flat buffers
+  // packed and unpacked on the device (PackFermionToFlat / UnpackFlatToFermion,
+  // same placement as the host loops) instead of unvectorize + host pack + H2D
+  // and D2H + host unpack + vectorize.  The same gemmBatched on the same
+  // bytes, so the same result.
+  void ApplyInverseLexDevice(const std::vector<const Field *> &ins,
+                             const std::vector<Field *> &outs, int cb) {
+    const int NRHS = static_cast<int>(ins.size());
+    const int N = kDim48;
+    const int Nmat = N * N;
+    const int N_x_NRHS = N * NRHS;
+    const uint64_t Nsite = rbgrid_.lSites();
+    const size_t flat_n = (size_t)Nsite * N_x_NRHS;
+
+    deviceVector<ComplexD>  &inv_dev   = (cb == Even) ? inv_dev_e_   : inv_dev_o_;
+    uint64_t                &inv_dev_n = (cb == Even) ? inv_dev_n_e_ : inv_dev_n_o_;
+    uint64_t                inv_gen    = (cb == Even) ? inv_dev_gen_e_ : inv_dev_gen_o_;
+    deviceVector<ComplexD>  &fin_dev   = (cb == Even) ? ferm_in_dev_e_  : ferm_in_dev_o_;
+    deviceVector<ComplexD>  &fout_dev  = (cb == Even) ? ferm_out_dev_e_ : ferm_out_dev_o_;
+    deviceVector<ComplexD*> &Amk       = (cb == Even) ? Amk_e_ : Amk_o_;
+    deviceVector<ComplexD*> &Bkn       = (cb == Even) ? Bkn_e_ : Bkn_o_;
+    deviceVector<ComplexD*> &Cmn       = (cb == Even) ? Cmn_e_ : Cmn_o_;
+    uint64_t &ptrs_gen   = (cb == Even) ? cublas_ptrs_gen_e_   : cublas_ptrs_gen_o_;
+    int      &ptrs_NRHS  = (cb == Even) ? cublas_ptrs_NRHS_e_  : cublas_ptrs_NRHS_o_;
+    uint64_t &ptrs_Nsite = (cb == Even) ? cublas_ptrs_Nsite_e_ : cublas_ptrs_Nsite_o_;
+
+    GRID_ASSERT(inv_dev_n == Nsite &&
+                "DTXQCD_MOOEEINV_CUBLAS requires DTXQCD_PRECOMPUTE_GPU=1 / "
+                "ImportFields to have populated inv_dev for this CB");
+
+    if (fin_dev.size() < flat_n) {
+      fin_dev.resize(flat_n);
+      fout_dev.resize(flat_n);
+      ptrs_gen = 0;  // pointers stale
+    }
+    const uint64_t *lex_of = LexOfOuterLane(&rbgrid_);
+    for (int k = 0; k < NRHS; ++k)
+      PackFermionToFlat(*ins[k], k, NRHS, lex_of, &fin_dev[0]);
+
+    bool need_rebuild = (ptrs_gen != inv_gen)
+                     || (ptrs_NRHS != NRHS)
+                     || (ptrs_Nsite != Nsite)
+                     || (Amk.size() != Nsite);
+    if (need_rebuild) {
+      Amk.resize(Nsite);
+      Bkn.resize(Nsite);
+      Cmn.resize(Nsite);
+      ComplexD *A_ptr = &inv_dev[0];
+      ComplexD *B_ptr = &fin_dev[0];
+      ComplexD *C_ptr = &fout_dev[0];
+      std::vector<ComplexD*> Amk_host(Nsite), Bkn_host(Nsite), Cmn_host(Nsite);
+      thread_for(s, Nsite, {
+        Amk_host[s] = &A_ptr[(size_t)s * Nmat];
+        Bkn_host[s] = &B_ptr[(size_t)s * N_x_NRHS];
+        Cmn_host[s] = &C_ptr[(size_t)s * N_x_NRHS];
+      });
+      acceleratorCopyToDevice((void*)Amk_host.data(), (void*)&Amk[0],
+                              Nsite * sizeof(ComplexD*));
+      acceleratorCopyToDevice((void*)Bkn_host.data(), (void*)&Bkn[0],
+                              Nsite * sizeof(ComplexD*));
+      acceleratorCopyToDevice((void*)Cmn_host.data(), (void*)&Cmn[0],
+                              Nsite * sizeof(ComplexD*));
+      ptrs_gen   = inv_gen;
+      ptrs_NRHS  = NRHS;
+      ptrs_Nsite = Nsite;
+    }
+
+    GridBLAS blas;
+    blas.gemmBatched(GridBLAS_OP_N, GridBLAS_OP_N,
+                     N, NRHS, N,
+                     ComplexD(1.0, 0.0),
+                     Amk, Bkn,
+                     ComplexD(0.0, 0.0),
+                     Cmn);
+    blas.synchronise();  // the host path's D2H copy waited for the gemm
+
+    for (int k = 0; k < NRHS; ++k) {
+      UnpackFlatToFermion(&fout_dev[0], k, NRHS, lex_of, *outs[k]);
+      for (int a = 0; a < DtxqcdNf; ++a) {
+        outs[k]->upper.f[a].Checkerboard() = cb;
+        outs[k]->lower.f[a].Checkerboard() = cb;
+      }
+    }
+  }
+#endif
+
   void ApplyInverseLex(const std::vector<const Field *> &ins,
                         const std::vector<Field *> &outs,
                         bool dag) {
@@ -1179,6 +1323,13 @@ class DTXQCDWilsonCloverFermionEO {
       }
       return;
     }
+
+#ifdef GRID_CUDA
+    if (UseMooeeInvCublas() && InvNDevicePack()) {
+      ApplyInverseLexDevice(ins, outs, cb);
+      return;
+    }
+#endif
 
     // Forward (no-dag) batched apply.
     const auto &inv_lex = (cb == Even) ? inv_lex_e_ : inv_lex_o_;

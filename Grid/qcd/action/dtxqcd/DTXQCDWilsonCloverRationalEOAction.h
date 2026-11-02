@@ -257,9 +257,19 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
       Moeh_Yk.emplace_back(&rbgrid_);
     }
 
+    if (ForceTimingOn()) ForceTimes() = ForceTiming();
+    double tf = ForceTimingOn() ? ForceTimingNow() : 0;
+    // Adds the time since the last reading to one ForceTiming field.
+    auto lap = [&](double ForceTiming::*field) {
+      if (!ForceTimingOn()) return;
+      const double now = ForceTimingNow();
+      ForceTimes().*field += now - tf;
+      tf = now;
+    };
     us_schur -= usecond();
     // Meooe X_k for all k (per-RHS Wilson stencil; no natural batched apply).
     for (int k = 0; k < Npole; ++k) Dw.Meooe(Xk[k], Meo_Xk[k]);
+    lap(&ForceTiming::meooe);
 
     // W_e_k = M_ee^{-1} M_eo X_k for all k -- single batched MooeeInvN call.
     {
@@ -268,6 +278,7 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
       for (int k = 0; k < Npole; ++k) { ins[k] = &Meo_Xk[k]; outs[k] = &Wek[k]; }
       Dw.MooeeInvN(ins, outs);
     }
+    lap(&ForceTiming::inv_n);
 
     // Y_k = M_oo X_k - M_oe W_e_k.
     DTXQCDFermionDoubled mooee_X(&rbgrid_), moe_W(&rbgrid_);
@@ -280,9 +291,11 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
         Yk[k].lower.f[a] = mooee_X.lower.f[a] - moe_W.lower.f[a];
       }
     }
+    lap(&ForceTiming::ybuild);
 
     // M_oe^dag Y_k for all k.
     for (int k = 0; k < Npole; ++k) Dw.MeooeDag(Yk[k], Moeh_Yk[k]);
+    lap(&ForceTiming::meooe_dag);
 
     // Z_e_k = (M_ee^{-1})^dag M_oe^dag Y_k -- single batched MooeeInvDagN call.
     {
@@ -291,18 +304,35 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
       for (int k = 0; k < Npole; ++k) { ins[k] = &Moeh_Yk[k]; outs[k] = &Zek[k]; }
       Dw.MooeeInvDagN(ins, outs);
     }
+    lap(&ForceTiming::inv_dag_n);
     us_schur += usecond();
 
     // ---- Per-pole site/aux force accumulation (each has its own ak) ----
+    us_site -= usecond();
+    std::unique_ptr<SiteForceCbAcc> acc_e, acc_o;
+    if (RatForceGpuEnabled() && CbAccumOn()) {
+      const int ncs = (csw_ != 0.0) ? 6 : 0;
+      acc_e.reset(new SiteForceCbAcc(&rbgrid_, ncs));
+      acc_o.reset(new SiteForceCbAcc(&rbgrid_, ncs));
+      PickSiteForceAcc(Even, *acc_e, dSdU, clover_sigma_full);
+      PickSiteForceAcc(Odd,  *acc_o, dSdU, clover_sigma_full);
+    }
+    us_site += usecond();
     for (int k = 0; k < Npole; ++k) {
       const RealD ak = PowerNegQuarter.residues[k];
       us_site -= usecond();
       AccumulateSiteForces(Xk[k],  Yk[k], /*odd_cb=*/true,  ak,
-                           dSdU, clover_sigma_full);
+                           dSdU, clover_sigma_full, acc_o.get());
       AccumulateSiteForces(Wek[k], Zek[k], /*odd_cb=*/false, ak,
-                           dSdU, clover_sigma_full);
+                           dSdU, clover_sigma_full, acc_e.get());
       us_site += usecond();
     }
+    us_site -= usecond();
+    if (acc_e) {
+      SetSiteForceAcc(*acc_e, dSdU, clover_sigma_full);
+      SetSiteForceAcc(*acc_o, dSdU, clover_sigma_full);
+    }
+    us_site += usecond();
     // ---- Hopping (Wilson dslash-deriv) gauge force, all poles ----
     // Virtual hook: the QUDA-primitive subclass batches all (flavor, pole) rhs
     // into computeCloverWilsonForceWithSchurFields (one call per doubled block,
@@ -330,6 +360,16 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
               << "  siteforce=" << (us_site * 1e-6)
               << "  hopping=" << (us_hop * 1e-6)
               << "  clover=" << (us_clov * 1e-6) << " (s)" << std::endl;
+    if (ForceTimingOn()) {
+      const ForceTiming &ft = ForceTimes();
+      std::cout << GridLogMessage << "[" << action_name()
+                << "] force timing (s): schur [Meooe=" << ft.meooe * 1e-6
+                << " MooeeInvN=" << ft.inv_n * 1e-6 << " Y=" << ft.ybuild * 1e-6
+                << " MeooeDag=" << ft.meooe_dag * 1e-6
+                << " MooeeInvDagN=" << ft.inv_dag_n * 1e-6 << "]"
+                << " siteforce [kernel=" << ft.extract * 1e-6
+                << " accumulate=" << ft.accumulate * 1e-6 << "]" << std::endl;
+    }
   }
 
   DTXQCDFermionDoubled &PseudoFermion() { return Phi_; }
@@ -588,6 +628,74 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
     setCheckerboard(full, cur);
   }
 
+  // DTXQCD_RATFORCE_CB_ACCUM (default 1, GPU site-force path): deriv() keeps
+  // one checkerboard copy of each aux-force and clover-sigma accumulator per
+  // CB for the whole pole loop -- picked from the full fields before it, the
+  // per-pole contributions added as cur = cur + coef * contrib (the same
+  // expression, in the same pole order, as AddCBLatticeToFull), written back
+  // after it -- instead of a pick / add / set round trip per pole, field and
+  // CB.  Nothing else touches these fields inside the loop, so the sums are
+  // the same.  =0 restores the round trips.
+  static bool CbAccumOn() {
+    static const bool on = []() {
+      const char *e = std::getenv("DTXQCD_RATFORCE_CB_ACCUM");
+      return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
+  }
+  struct SiteForceCbAcc {
+    LatticeDtxqcdSigma sigma;
+    LatticeDtxqcdPi    pi;
+    LatticeDtxqcdD     d;
+    LatticeDtxqcdN     n;
+    LatticeDtxqcdS     s;
+    LatticeDtxqcdP     p;
+    std::vector<LatticeColourMatrix> cs;  // empty when csw == 0
+    SiteForceCbAcc(GridBase *rb, int ncs)
+        : sigma(rb), pi(rb), d(rb), n(rb), s(rb), p(rb) {
+      for (int k = 0; k < ncs; ++k) cs.emplace_back(rb);
+    }
+  };
+  void PickSiteForceAcc(int cb, SiteForceCbAcc &acc, const DTXQCDField &dSdU,
+                        const std::vector<LatticeColourMatrix> &clover_sigma_full) {
+    pickCheckerboard(cb, acc.sigma, dSdU.sigma);
+    pickCheckerboard(cb, acc.pi,    dSdU.pi);
+    pickCheckerboard(cb, acc.d,     dSdU.d);
+    pickCheckerboard(cb, acc.n,     dSdU.n);
+    pickCheckerboard(cb, acc.s,     dSdU.s);
+    pickCheckerboard(cb, acc.p,     dSdU.p);
+    for (size_t k = 0; k < acc.cs.size(); ++k)
+      pickCheckerboard(cb, acc.cs[k], clover_sigma_full[k]);
+  }
+  void SetSiteForceAcc(const SiteForceCbAcc &acc, DTXQCDField &dSdU,
+                       std::vector<LatticeColourMatrix> &clover_sigma_full) {
+    setCheckerboard(dSdU.sigma, acc.sigma);
+    setCheckerboard(dSdU.pi,    acc.pi);
+    setCheckerboard(dSdU.d,     acc.d);
+    setCheckerboard(dSdU.n,     acc.n);
+    setCheckerboard(dSdU.s,     acc.s);
+    setCheckerboard(dSdU.p,     acc.p);
+    for (size_t k = 0; k < acc.cs.size(); ++k)
+      setCheckerboard(clover_sigma_full[k], acc.cs[k]);
+  }
+
+  // DTXQCD_FORCE_TIMING=1: per deriv() call, split the force assembly further
+  // (Schur pieces; site forces into kernel vs accumulation), with a device
+  // barrier before each reading.  Timing only; no effect on any result.
+  struct ForceTiming {
+    double meooe = 0, inv_n = 0, ybuild = 0, meooe_dag = 0, inv_dag_n = 0;
+    double extract = 0, accumulate = 0;
+  };
+  static ForceTiming &ForceTimes() { static ForceTiming t; return t; }
+  static bool ForceTimingOn() {
+    static const bool on = []() {
+      const char *e = std::getenv("DTXQCD_FORCE_TIMING");
+      return e && *e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  static double ForceTimingNow() { accelerator_barrier(); return usecond(); }
+
   // DTXQCD_RATFORCE_GPU: route AccumulateSiteForces through the GPU kernel
   // (DTXQCDRationalForceGpuKernel.h).  DEFAULT OFF everywhere (CPU thread_for
   // is the bit-comparable reference); off-CUDA always CPU.
@@ -655,7 +763,8 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
                             bool odd_cb,
                             RealD ak,
                             DTXQCDField &dSdU,
-                            std::vector<LatticeColourMatrix> &clover_sigma_full) {
+                            std::vector<LatticeColourMatrix> &clover_sigma_full,
+                            SiteForceCbAcc *acc = nullptr) {
     using DtxqcdSiteForceKernel::SigSobj;
     using DtxqcdSiteForceKernel::PiSobj;
     using DtxqcdSiteForceKernel::DSobj;
@@ -680,17 +789,35 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
           LatticeColourMatrix(&rbgrid_), LatticeColourMatrix(&rbgrid_),
           LatticeColourMatrix(&rbgrid_), LatticeColourMatrix(&rbgrid_),
           LatticeColourMatrix(&rbgrid_), LatticeColourMatrix(&rbgrid_)};
+      const double t0 = ForceTimingOn() ? ForceTimingNow() : 0;
       DtxqcdRatForceGpu::Extract(X, Y, cb, csw_, spin_,
                                  F_sig, F_pi, F_d, F_n, F_s, F_p, F_cs);
-      AddCBLatticeToFull(F_sig, dSdU.sigma, cb, coef);
-      AddCBLatticeToFull(F_pi,  dSdU.pi,    cb, coef);
-      AddCBLatticeToFull(F_d,   dSdU.d,     cb, coef);
-      AddCBLatticeToFull(F_n,   dSdU.n,     cb, coef);
-      AddCBLatticeToFull(F_s,   dSdU.s,     cb, coef);
-      AddCBLatticeToFull(F_p,   dSdU.p,     cb, coef);
-      if (csw_ != 0.0)
-        for (int k = 0; k < 6; ++k)
-          AddCBLatticeToFull(F_cs[k], clover_sigma_full[k], cb, coef);
+      const double t1 = ForceTimingOn() ? ForceTimingNow() : 0;
+      if (acc) {  // CbAccumOn(): the CB accumulators of deriv()
+        acc->sigma = acc->sigma + coef * F_sig;
+        acc->pi    = acc->pi    + coef * F_pi;
+        acc->d     = acc->d     + coef * F_d;
+        acc->n     = acc->n     + coef * F_n;
+        acc->s     = acc->s     + coef * F_s;
+        acc->p     = acc->p     + coef * F_p;
+        for (size_t k = 0; k < acc->cs.size(); ++k)
+          acc->cs[k] = acc->cs[k] + coef * F_cs[k];
+      } else {
+        AddCBLatticeToFull(F_sig, dSdU.sigma, cb, coef);
+        AddCBLatticeToFull(F_pi,  dSdU.pi,    cb, coef);
+        AddCBLatticeToFull(F_d,   dSdU.d,     cb, coef);
+        AddCBLatticeToFull(F_n,   dSdU.n,     cb, coef);
+        AddCBLatticeToFull(F_s,   dSdU.s,     cb, coef);
+        AddCBLatticeToFull(F_p,   dSdU.p,     cb, coef);
+        if (csw_ != 0.0)
+          for (int k = 0; k < 6; ++k)
+            AddCBLatticeToFull(F_cs[k], clover_sigma_full[k], cb, coef);
+      }
+      if (ForceTimingOn()) {
+        const double t2 = ForceTimingNow();
+        ForceTimes().extract += t1 - t0;
+        ForceTimes().accumulate += t2 - t1;
+      }
       return;
     }
 
