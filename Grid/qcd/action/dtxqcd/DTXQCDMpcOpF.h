@@ -207,6 +207,9 @@ class DTXQCDMpcOpF {
     typedef decltype(coalescedRead(in_up_v[0][0])) FermSitePerLane;
     const int Nsimd = LatticeFermionF::vector_object::Nsimd();
 
+    if (DtxqcdSiteApplyRowsOn()) {
+      DtxqcdSiteApplyRows(mat_v, in_up_v, in_lo_v, out_up_v, out_lo_v, fg->oSites(), Nsimd);
+    } else {
     accelerator_for(s, fg->oSites(), Nsimd, {
       auto Mlane = mat_v(s);
       FermSitePerLane in_up[DtxqcdNf], in_lo[DtxqcdNf];
@@ -249,6 +252,7 @@ class DTXQCDMpcOpF {
         coalescedWrite(out_lo_v[a][s], out_lo[a]);
       }
     });
+    }
 
     for (int a = 0; a < DtxqcdNf; ++a) {
       in_up_v[a].ViewClose();

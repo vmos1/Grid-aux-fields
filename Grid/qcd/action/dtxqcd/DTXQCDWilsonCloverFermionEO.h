@@ -54,6 +54,55 @@ NAMESPACE_BEGIN(Grid);
 template <class vtype>
 using DtxqcdSiteInvMat = iScalar<iScalar<iMatrix<vtype, kDtxqcdSiteDim48>>>;
 
+// DTXQCD_SITE_APPLY_ROWS (default 1): apply the cached 48x48 site matrices
+// with DtxqcdSiteApplyRows below instead of the site-serial kernels (one GPU
+// thread per site lane summing all 2304 products).  =0 restores those.
+inline bool DtxqcdSiteApplyRowsOn() {
+  static const bool on = []() {
+    const char *e = std::getenv("DTXQCD_SITE_APPLY_ROWS");
+    return !(e && *e && std::atoi(e) == 0);
+  }();
+  return on;
+}
+
+// out(s) = M(s) in(s) on a doubled fermion, M a cached 48x48 site matrix
+// (rows/columns 0..23 upper (a, alpha, i), 24..47 lower).  One thread per
+// (outer site, row, SIMD lane), 48x the threads of the site-serial kernels;
+// each row sums its 48 products in the same column order with the same
+// scalar arithmetic, so the result is the same.  Views as the callers make
+// them (std::array of fermion views per block).
+template <class MatView, class InViews, class OutViews>
+inline void DtxqcdSiteApplyRows(const MatView &mat_v,
+                                const InViews &in_up_v, const InViews &in_lo_v,
+                                OutViews &out_up_v, OutViews &out_lo_v,
+                                uint64_t osites, int Nsimd) {
+  constexpr int N24 = kDtxqcdSiteDim24, N48 = kDtxqcdSiteDim48, NsNc = Ns * Nc;
+  accelerator_for(i, osites * N48, Nsimd, {
+    const uint64_t s = i / N48;
+    const int r = (int)(i % N48);
+    const int r_blk = r / N24, r24 = r % N24;
+    const int r_a = r24 / NsNc, r_alpha = (r24 % NsNc) / Nc, r_i = r24 % Nc;
+    typedef decltype(coalescedRead(mat_v[0]()()(0, 0))) MEl;
+    MEl sum;
+    zeroit(sum);
+    for (int c_blk = 0; c_blk < 2; ++c_blk) {
+      for (int c_a = 0; c_a < DtxqcdNf; ++c_a) {
+        for (int c_alpha = 0; c_alpha < Ns; ++c_alpha) {
+          for (int c_i = 0; c_i < Nc; ++c_i) {
+            const int c = c_blk * N24 + c_a * NsNc + c_alpha * Nc + c_i;
+            auto Mrc = coalescedRead(mat_v[s]()()(r, c));
+            auto vc = (c_blk == 0) ? coalescedRead(in_up_v[c_a][s]()(c_alpha)(c_i))
+                                   : coalescedRead(in_lo_v[c_a][s]()(c_alpha)(c_i));
+            sum = sum + Mrc * vc;
+          }
+        }
+      }
+    }
+    if (r_blk == 0) coalescedWrite(out_up_v[r_a][s]()(r_alpha)(r_i), sum);
+    else            coalescedWrite(out_lo_v[r_a][s]()(r_alpha)(r_i), sum);
+  });
+}
+
 class DTXQCDWilsonCloverFermionEO {
  public:
   typedef WilsonImplR Impl;
@@ -943,6 +992,9 @@ class DTXQCDWilsonCloverFermionEO {
     typedef decltype(coalescedRead(in_up_v[0][0])) FermSitePerLane;
     const int Nsimd = LatticeFermion::vector_object::Nsimd();
 
+    if (DtxqcdSiteApplyRowsOn()) {
+      DtxqcdSiteApplyRows(fwd_v, in_up_v, in_lo_v, out_up_v, out_lo_v, fg->oSites(), Nsimd);
+    } else {
     accelerator_for(s, fg->oSites(), Nsimd, {
       auto Mlane = fwd_v(s);
       FermSitePerLane in_up[DtxqcdNf], in_lo[DtxqcdNf];
@@ -988,6 +1040,7 @@ class DTXQCDWilsonCloverFermionEO {
         coalescedWrite(out_lo_v[a][s], out_lo[a]);
       }
     });
+    }
 
     for (int a = 0; a < DtxqcdNf; ++a) {
       in_up_v[a].ViewClose();
@@ -1014,6 +1067,9 @@ class DTXQCDWilsonCloverFermionEO {
     typedef decltype(coalescedRead(in_up_v[0][0])) FermSitePerLane;
     const int Nsimd = LatticeFermion::vector_object::Nsimd();
 
+    if (DtxqcdSiteApplyRowsOn()) {
+      DtxqcdSiteApplyRows(inv_v, in_up_v, in_lo_v, out_up_v, out_lo_v, fg->oSites(), Nsimd);
+    } else {
     accelerator_for(s, fg->oSites(), Nsimd, {
       auto Mlane = inv_v(s);
       FermSitePerLane in_up[DtxqcdNf], in_lo[DtxqcdNf];
@@ -1059,6 +1115,7 @@ class DTXQCDWilsonCloverFermionEO {
         coalescedWrite(out_lo_v[a][s], out_lo[a]);
       }
     });
+    }
 
     for (int a = 0; a < DtxqcdNf; ++a) {
       in_up_v[a].ViewClose();
