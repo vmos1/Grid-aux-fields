@@ -368,7 +368,9 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
                 << " MeooeDag=" << ft.meooe_dag * 1e-6
                 << " MooeeInvDagN=" << ft.inv_dag_n * 1e-6 << "]"
                 << " siteforce [kernel=" << ft.extract * 1e-6
-                << " accumulate=" << ft.accumulate * 1e-6 << "]" << std::endl;
+                << " accumulate=" << ft.accumulate * 1e-6 << "]"
+                << " hopping [Wilson derivs=" << ft.hop_deriv * 1e-6
+                << " combine=" << ft.hop_combine * 1e-6 << "]" << std::endl;
     }
   }
 
@@ -560,6 +562,70 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
     auto &Wu    = meooe.UpperWilson();
     auto &Wl    = meooe.LowerWilson();
 
+    double th = ForceTimingOn() ? ForceTimingNow() : 0;
+    // Adds the time since the last reading to one ForceTiming field.
+    auto lap = [&](double ForceTiming::*field) {
+      if (!ForceTimingOn()) return;
+      const double now = ForceTimingNow();
+      ForceTimes().*field += now - th;
+      th = now;
+    };
+
+    if (HopForceCbAccumOn()) {
+      // Per-CB accumulators: on each odd (even) site the same running
+      // difference 0 - F1 - F2 - ... as the full-grid path below, without the
+      // two setCheckerboard copies and the full-grid subtract per pair.
+      // MoeDeriv returns its force on the odd CB, MeoDeriv on the even CB.
+      LatticeGaugeField gup_o(&rbgrid_), gup_e(&rbgrid_);
+      LatticeGaugeField glo_o(&rbgrid_), glo_e(&rbgrid_);
+      gup_o.Checkerboard() = Odd;  gup_o = Zero();
+      gup_e.Checkerboard() = Even; gup_e = Zero();
+      glo_o.Checkerboard() = Odd;  glo_o = Zero();
+      glo_e.Checkerboard() = Even; glo_e = Zero();
+      LatticeGaugeField ForceO(&rbgrid_), ForceE(&rbgrid_);
+      lap(&ForceTiming::hop_combine);
+      for (int a = 0; a < DtxqcdNf; ++a) {
+        // ---- Upper block (gauge = U) -----------------------------------
+        Wu.MoeDeriv(ForceO, Y.upper.f[a],   W_e.upper.f[a], DaggerNo);
+        Wu.MeoDeriv(ForceE, Z_e.upper.f[a], X.upper.f[a],   DaggerNo);
+        lap(&ForceTiming::hop_deriv);
+        gup_o = gup_o - ForceO;
+        gup_e = gup_e - ForceE;
+        lap(&ForceTiming::hop_combine);
+
+        Wu.MoeDeriv(ForceO, X.upper.f[a],   Z_e.upper.f[a], DaggerYes);
+        Wu.MeoDeriv(ForceE, W_e.upper.f[a], Y.upper.f[a],   DaggerYes);
+        lap(&ForceTiming::hop_deriv);
+        gup_o = gup_o - ForceO;
+        gup_e = gup_e - ForceE;
+        lap(&ForceTiming::hop_combine);
+
+        // ---- Lower block (gauge = U_conj) ------------------------------
+        Wl.MoeDeriv(ForceO, Y.lower.f[a],   W_e.lower.f[a], DaggerNo);
+        Wl.MeoDeriv(ForceE, Z_e.lower.f[a], X.lower.f[a],   DaggerNo);
+        lap(&ForceTiming::hop_deriv);
+        glo_o = glo_o - ForceO;
+        glo_e = glo_e - ForceE;
+        lap(&ForceTiming::hop_combine);
+
+        Wl.MoeDeriv(ForceO, X.lower.f[a],   Z_e.lower.f[a], DaggerYes);
+        Wl.MeoDeriv(ForceE, W_e.lower.f[a], Y.lower.f[a],   DaggerYes);
+        lap(&ForceTiming::hop_deriv);
+        glo_o = glo_o - ForceO;
+        glo_e = glo_e - ForceE;
+        lap(&ForceTiming::hop_combine);
+      }
+      LatticeGaugeField gforce_upper(&grid_), gforce_lower(&grid_);
+      setCheckerboard(gforce_upper, gup_o);
+      setCheckerboard(gforce_upper, gup_e);
+      setCheckerboard(gforce_lower, glo_o);
+      setCheckerboard(gforce_lower, glo_e);
+      gforce_lower = conjugate(gforce_lower);
+      dSdU.U = dSdU.U + ak * (gforce_upper + gforce_lower);
+      lap(&ForceTiming::hop_combine);
+      return;
+    }
+
     LatticeGaugeField gforce_upper(&grid_);  gforce_upper = Zero();
     LatticeGaugeField gforce_lower(&grid_);  gforce_lower = Zero();
     LatticeGaugeField gtmp(&grid_);
@@ -597,6 +663,18 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
     gforce_lower = conjugate(gforce_lower);
 
     dSdU.U = dSdU.U + ak * (gforce_upper + gforce_lower);
+    lap(&ForceTiming::hop_deriv);  // legacy path: derivs and combine together
+  }
+
+  // DTXQCD_HOPFORCE_CB_ACCUM (default 1): AccumulateHoppingForce keeps its
+  // per-block running sums on the two checkerboards and assembles the full
+  // fields once per pole.  =0 restores the full-grid sums.
+  static bool HopForceCbAccumOn() {
+    static const bool on = []() {
+      const char *e = std::getenv("DTXQCD_HOPFORCE_CB_ACCUM");
+      return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
   }
 
   // Accumulate (+= coef * arr) a lex-ordered CB host array into the CB sites of
@@ -685,6 +763,7 @@ class DTXQCDWilsonCloverRationalEOAction : public Action<DTXQCDField> {
   struct ForceTiming {
     double meooe = 0, inv_n = 0, ybuild = 0, meooe_dag = 0, inv_dag_n = 0;
     double extract = 0, accumulate = 0;
+    double hop_deriv = 0, hop_combine = 0;
   };
   static ForceTiming &ForceTimes() { static ForceTiming t; return t; }
   static bool ForceTimingOn() {
