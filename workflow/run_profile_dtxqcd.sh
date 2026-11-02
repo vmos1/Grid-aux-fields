@@ -1,5 +1,5 @@
 #!/bin/bash
-# Profile run of the fork's gen_dtxqcd_cfgs (campaign aux-optim) inside an EXISTING
+# Profile run of the fork's gen_dtxqcd_cfgs (campaigns aux-optim, aux-cg) inside an EXISTING
 # 1-node allocation: 4 ranks x 1 GPU, the collaborator's launcher defaults
 # (production/run_dtxqcd_gencfgs.sh at v2-txqcd), started from the thermalized Chroma
 # 16^3x48 configuration our 16^3 gate uses, a few trajectories, the first force-accepted.
@@ -9,7 +9,8 @@
 # Env: TREE (source tree, for the provenance SHA), BIN (default INSTALL_BIN/gen_dtxqcd_cfgs;
 #      both from workflow/paths.sh), LATT (16.16.16.48), TRAJ (3, a target total),
 #      NO_METROP (1), IMPORT_CFG (Chroma cfg 11100), DEVICE_MEM (38000, the
-#      launcher's), TIMEOUT (100m).
+#      launcher's), TIMEOUT (100m), COMMS_PRESET (gridqcd | legacy, below),
+#      GRID_ALLOC_NCACHE_LARGE (64, below).
 # Output: runs/<RUN>/run.log in the workspace; runs/<RUN> is the generator's cwd, so its
 # cfgs/ lands there (N_SKIP=10: no checkpoint within 3 trajectories). The log ends with
 # exit=<rc>, which workflow/wait_for_exit.sh waits for. Analyse with
@@ -49,7 +50,30 @@ GEN_ENV=(LATT="$LATT" DTXQCD_LAZY_SMEAR=1 LAMBDA_DTXQCD=10.0 MASS_LIGHT_DTXQCD=-
   INTEGRATOR=MinimumNorm2 MDSTEPS=10 TRAJL=0.353553390593274 GAUGE_MULT=8 AUX_MULT=1
   TRAJ="$TRAJ" NO_METROP="$NO_METROP" N_SKIP=10 CG_TOL=1e-8 DIAG_TRMINV_INTERVAL=0
   DTXQCD_SUFFIX=_profile IMPORT_CFG="$IMPORT_CFG" "$@")
-GRID_ARGS=(--grid "$LATT" --mpi 1.1.1.4 --accelerator-threads 8 --shm 1024 --shm-mpi 0 --device-mem "$DEVICE_MEM")
+# Comms / MPI flags. gridqcd (default since 2026-11-02, campaign aux-cg): the flag set of
+# grid_qcd's production trajectory launcher (5_studies/hasenbusch_tune/perlmutter/
+# traj48_puregrid.sh): --comms-overlap --shm 2048 --shm-mpi 0, MPICH GPU IPC + GPU-direct
+# RDMA on, eager host registration and no-async-memcpy off, NIC policy GPU (inter-node only).
+# legacy: the flags of every aux-optim run before that (no --comms-overlap, --shm 1024, MPICH
+# defaults), kept to A/B against the earlier logs.
+COMMS_PRESET=${COMMS_PRESET:-gridqcd}
+case "$COMMS_PRESET" in
+  gridqcd)
+    export MPICH_GPU_IPC_ENABLED=1 MPICH_RDMA_ENABLED_CUDA=1
+    export MPICH_GPU_EAGER_REGISTER_HOST_MEM=0 MPICH_GPU_NO_ASYNC_MEMCPY=0 MPICH_OFI_NIC_POLICY=GPU
+    COMMS_ARGS=(--shm 2048 --shm-mpi 0 --comms-overlap)
+    COMMS_ENV="MPICH_GPU_IPC_ENABLED=1 MPICH_RDMA_ENABLED_CUDA=1 MPICH_GPU_EAGER_REGISTER_HOST_MEM=0 MPICH_GPU_NO_ASYNC_MEMCPY=0 MPICH_OFI_NIC_POLICY=GPU" ;;
+  legacy)
+    COMMS_ARGS=(--shm 1024 --shm-mpi 0)
+    COMMS_ENV="(MPICH defaults)" ;;
+  *) echo "ERROR: COMMS_PRESET must be gridqcd or legacy" >&2; exit 2 ;;
+esac
+GRID_ARGS=(--grid "$LATT" --mpi 1.1.1.4 --accelerator-threads 8 "${COMMS_ARGS[@]}" --device-mem "$DEVICE_MEM")
+# Grid's cache of freed device allocations (default 8 large entries). One DTXQCD operator
+# call creates 12-20 temporary lattices, so at 8 every call went to cudaMalloc/cudaFree:
+# 64 took a 16^3x48 trajectory 498 -> 320 s, bit-identical (aux-cg step 0, 2026-11-02).
+# Environment only; set GRID_ALLOC_NCACHE_LARGE=8 to reproduce the old behaviour.
+export GRID_ALLOC_NCACHE_LARGE=${GRID_ALLOC_NCACHE_LARGE:-64}
 
 dirty=no
 [ -n "$(git -C "$TREE" status --porcelain --untracked-files=no)" ] && dirty=yes
@@ -57,6 +81,7 @@ dirty=no
   echo "ENV PROFILE_DTXQCD RUN=$RUN JOBID=$SLURM_JOB_ID BIN=$BIN BIN_SHA256=$(sha256sum "$BIN" | cut -c1-64) GRID_SHA=$(git -C "$TREE" rev-parse HEAD) GRID_DIRTY=$dirty OMP_NUM_THREADS=8 MPICH_GPU_SUPPORT_ENABLED=1"
   echo "ENV GEN ${GEN_ENV[*]}"
   echo "ENV GRID_ARGS ${GRID_ARGS[*]}"
+  echo "ENV COMMS_PRESET=$COMMS_PRESET $COMMS_ENV GRID_ALLOC_NCACHE_LARGE=$GRID_ALLOC_NCACHE_LARGE"
   echo "ENV LDD $(ldd "$BIN" | grep -c 'not found') unresolved, $(ldd "$BIN" | grep -ci quda) quda"
   echo "ENV START $(date '+%Y-%m-%d %H:%M:%S %Z')"
 } > "$LOG"

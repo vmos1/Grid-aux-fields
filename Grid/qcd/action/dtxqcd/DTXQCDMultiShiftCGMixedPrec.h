@@ -268,11 +268,41 @@ inline void DTXQCDMultiShiftCGMixedPrec(
   GridStopWatch MatrixTimer, PrecChangeTimer, ReliableTimer;
   int reliable_updates = 0;
 
+  // DTXQCD_CG_TIMING=1: one line per solve splitting the main loop into the
+  // SP operator (hopping / 48x48 site matrices / rest, from Mop_f's own
+  // accumulators), precision changes, the per-shift vector updates and the
+  // rest, plus the post-convergence cleanup.  Timing only.
+  const bool cg_timing = DTXQCDMopF::CgTiming();
+  GridStopWatch ShiftTimer;
+  typename DTXQCDMopF::Timing op_main;
+  if (cg_timing) DTXQCDMopF::Times() = typename DTXQCDMopF::Timing();
+  const double t_loop0 = cg_timing ? usecond() : 0;
+  double t_loop1 = 0;
+  auto print_cg_timing = [&](int k) {
+    if (!cg_timing) return;
+    const double t_end = usecond();
+    const auto &all = DTXQCDMopF::Times();
+    const double loop = (t_loop1 - t_loop0) / 1e6, op = MatrixTimer.useconds() / 1e6;
+    const double prec = PrecChangeTimer.useconds() / 1e6, sh = ShiftTimer.useconds() / 1e6;
+    const double rel = ReliableTimer.useconds() / 1e6;
+    std::cout << GridLogMessage << "[DTXQCD-CG timing] mixed-prec multishift (s): iters=" << k
+              << " nshift=" << nshift << " main-loop=" << loop << " op=" << op
+              << " [M/Mdag calls=" << op_main.calls << " hop=" << op_main.hop / 1e6
+              << " site=" << op_main.site / 1e6
+              << " other=" << (op_main.total - op_main.hop - op_main.site) / 1e6 << "]"
+              << " precChange=" << prec << " shift-updates=" << sh << " reliable=" << rel
+              << " rest=" << loop - op - prec - sh - rel
+              << " cleanup+verify=" << (t_end - t_loop1) / 1e6
+              << " [SP M/Mdag calls=" << all.calls - op_main.calls
+              << " time=" << (all.total - op_main.total) / 1e6 << "]" << std::endl;
+  };
+
   for (int k = 1; k <= MaxIter; ++k) {
     RealD aa = c / cp;
 
     Scale_Add(p, aa, r);
 
+    if (cg_timing) ShiftTimer.Start();
     for (int s = 0; s < nshift; ++s) {
       if (converged[s]) continue;
       if (s == 0) {
@@ -288,6 +318,7 @@ inline void DTXQCDMultiShiftCGMixedPrec(
         }
       }
     }
+    if (cg_timing) { accelerator_barrier(); ShiftTimer.Stop(); }
 
     RealD cp_prev = c;
 
@@ -326,10 +357,12 @@ inline void DTXQCDMultiShiftCGMixedPrec(
       bs[s] = b * z[s][iz] / z0;
     }
 
+    if (cg_timing) ShiftTimer.Start();
     for (int s = 0; s < nshift; ++s) {
       if (converged[s]) continue;
       Axpy(psi[s], -bs[s] * alpha[s], ps[s]);
     }
+    if (cg_timing) { accelerator_barrier(); ShiftTimer.Stop(); }
 
     // ---- Reliable update: recompute the true primary residual in DP ----
     if (k % ReliableUpdateFreq == 0) {
@@ -363,6 +396,7 @@ inline void DTXQCDMultiShiftCGMixedPrec(
       }
     }
     if (all_converged) {
+      if (cg_timing) { t_loop1 = usecond(); op_main = DTXQCDMopF::Times(); }
       // The SP multishift Krylov pass typically converges the primary shift
       // but leaves the tighter shifts just above tol (SP residual floor
       // ~1e-7).  Polish each under-converged shift with a single-shift
@@ -419,6 +453,7 @@ inline void DTXQCDMultiShiftCGMixedPrec(
                   << "  precChange=" << PrecChangeTimer.Elapsed()
                   << "  reliable=" << ReliableTimer.Elapsed()
                   << "  [MP_CG_CLEANUP=1]" << std::endl;
+        print_cg_timing(k);
         return;
       }
       // Legacy path: per-shift DP probe + MP cleanup (with DP reliable update inside).
@@ -445,6 +480,7 @@ inline void DTXQCDMultiShiftCGMixedPrec(
                 << "  SP-matrix=" << MatrixTimer.Elapsed()
                 << "  precChange=" << PrecChangeTimer.Elapsed()
                 << "  reliable=" << ReliableTimer.Elapsed() << std::endl;
+      print_cg_timing(k);
       return;
     }
   }

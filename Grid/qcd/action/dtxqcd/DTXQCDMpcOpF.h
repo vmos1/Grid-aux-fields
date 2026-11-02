@@ -75,19 +75,38 @@ class DTXQCDMpcOpF {
   GridCartesian         &Grid()   { return grid_f_; }
   GridRedBlackCartesian &RbGrid() { return rbgrid_f_; }
 
+  // DTXQCD_CG_TIMING=1: accumulate wall time (us) of M/Mdag and of their
+  // hopping (Meooe) and 48x48 site-matrix (ApplySimd) parts, with a device
+  // barrier before each reading.  The solvers print and reset it per solve.
+  // Timing only; no effect on any result.
+  struct Timing { double total = 0, hop = 0, site = 0; uint64_t calls = 0; };
+  static Timing &Times() { static Timing t; return t; }
+  static bool CgTiming() {
+    static const bool on = []() {
+      const char *e = std::getenv("DTXQCD_CG_TIMING");
+      return e && *e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  static double TimingNow() { accelerator_barrier(); return usecond(); }
+
   // -------- EO pieces (SP) --------
 
   void Meooe(const Field &in, Field &out) {
+    const double t0 = CgTiming() ? TimingNow() : 0;
     for (int a = 0; a < DtxqcdNf; ++a) {
       Dw_upper_f_.Meooe(in.upper.f[a], out.upper.f[a]);
       Dw_lower_f_.Meooe(in.lower.f[a], out.lower.f[a]);
     }
+    if (CgTiming()) Times().hop += TimingNow() - t0;
   }
   void MeooeDag(const Field &in, Field &out) {
+    const double t0 = CgTiming() ? TimingNow() : 0;
     for (int a = 0; a < DtxqcdNf; ++a) {
       Dw_upper_f_.MeooeDag(in.upper.f[a], out.upper.f[a]);
       Dw_lower_f_.MeooeDag(in.lower.f[a], out.lower.f[a]);
     }
+    if (CgTiming()) Times().hop += TimingNow() - t0;
   }
 
   void Mooee(const Field &in, Field &out) {
@@ -108,6 +127,7 @@ class DTXQCDMpcOpF {
   // -------- Mpc / Mpc^dag (SP) --------
 
   void M(const Field &in, Field &out) {
+    const double t0 = CgTiming() ? TimingNow() : 0;
     GridBase *grid = in.Grid();
     Field tmp_e(grid), tmp_e2(grid), tmp_o(grid);
     Meooe(in, tmp_e);          // M_eo psi_o  (odd -> even)
@@ -115,9 +135,11 @@ class DTXQCDMpcOpF {
     Meooe(tmp_e2, tmp_o);      // M_oe (...)
     Mooee(in, out);            // M_oo psi_o
     SubInPlace(out, tmp_o);
+    if (CgTiming()) { Times().total += TimingNow() - t0; ++Times().calls; }
   }
 
   void Mdag(const Field &in, Field &out) {
+    const double t0 = CgTiming() ? TimingNow() : 0;
     GridBase *grid = in.Grid();
     Field tmp_e(grid), tmp_e2(grid), tmp_o(grid);
     MeooeDag(in, tmp_e);
@@ -125,6 +147,7 @@ class DTXQCDMpcOpF {
     MeooeDag(tmp_e2, tmp_o);
     MooeeDag(in, out);
     SubInPlace(out, tmp_o);
+    if (CgTiming()) { Times().total += TimingNow() - t0; ++Times().calls; }
   }
 
  private:
@@ -165,6 +188,7 @@ class DTXQCDMpcOpF {
   // 0..23 upper(a,alpha,i), rows 24..47 lower).  Public for the same nvcc
   // extended-lambda reason as the DP twin.
   void ApplySimd(const InvFieldF &mat, const Field &in, Field &out, int cb) {
+    const double t0 = CgTiming() ? TimingNow() : 0;
     GridBase *fg = in.upper.f[0].Grid();
     for (int a = 0; a < DtxqcdNf; ++a) {
       out.upper.f[a].Checkerboard() = cb;
@@ -232,6 +256,7 @@ class DTXQCDMpcOpF {
       out_up_v[a].ViewClose();
       out_lo_v[a].ViewClose();
     }
+    if (CgTiming()) Times().site += TimingNow() - t0;
   }
 
  private:

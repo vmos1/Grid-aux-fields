@@ -128,6 +128,21 @@ inline void DTXQCDMultiShiftCG(DTXQCDMop &Mop,
     Set_Scaled(psi[s], -bs[s] * alpha[s], src);
   }
 
+  // DTXQCD_CG_TIMING=1: one line per solve, total vs the DP operator.
+  // Timing only.
+  static const bool cg_timing = []() {
+    const char *e = std::getenv("DTXQCD_CG_TIMING");
+    return e && *e && std::atoi(e) != 0;
+  }();
+  const double t_solve0 = cg_timing ? usecond() : 0;
+  double t_op = 0;
+  auto print_cg_timing = [&](int k) {
+    if (!cg_timing) return;
+    std::cout << GridLogMessage << "[DTXQCD-CG timing] double-prec multishift (s): iters=" << k
+              << " nshift=" << nshift << " total=" << (usecond() - t_solve0) / 1e6
+              << " op=" << t_op / 1e6 << std::endl;
+  };
+
   for (int k = 1; k <= MaxIter; ++k) {
     RealD aa = c / cp;
 
@@ -151,8 +166,11 @@ inline void DTXQCDMultiShiftCG(DTXQCDMop &Mop,
     }
 
     RealD cp_prev = c;
+    double t_op0 = 0;
+    if (cg_timing) { accelerator_barrier(); t_op0 = usecond(); }
     Mop.M(p, tmp);
     Mop.Mdag(tmp, mmp);
+    if (cg_timing) { accelerator_barrier(); t_op += usecond() - t_op0; }
     d = real(innerProduct(p, mmp));
     Axpy(mmp, poles[0], p);
     rn = norm2(p);
@@ -195,12 +213,14 @@ inline void DTXQCDMultiShiftCG(DTXQCDMop &Mop,
     if (all_converged) {
       std::cout << GridLogMessage << "[DTXQCDMultiShiftCG] converged iter=" << k
                 << " nshift=" << nshift << std::endl;
+      print_cg_timing(k);
       return;
     }
   }
   std::cout << GridLogMessage
             << "[DTXQCDMultiShiftCG] did not converge in " << MaxIter
             << " iterations (c=" << c << ")" << std::endl;
+  print_cg_timing(MaxIter);
 }
 
 NAMESPACE_END(Grid);
