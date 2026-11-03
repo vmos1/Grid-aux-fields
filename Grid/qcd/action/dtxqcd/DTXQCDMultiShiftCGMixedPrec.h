@@ -80,12 +80,13 @@ inline bool DTXQCDSingleShiftCGSpCleanup(
   GridBase *grid_f = &Mop_f.RbGrid();
   DTXQCDFermionDoubled r(grid), p(grid), Ap(grid), mmp(grid);
   DTXQCDFermionDoubledF p_f(grid_f), mmp_f(grid_f), tmp_f(grid_f);
+  DtxqcdPrecisionMaps pc_maps(grid, grid_f);
 
   auto ApplyShiftSP = [&](const DTXQCDFermionDoubled &in,
                           DTXQCDFermionDoubled &out) {
-    DtxqcdPrecisionChange(p_f, in);
+    DtxqcdPrecisionChange(p_f, in, pc_maps);
     DtxqcdHermOpF(Mop_f, p_f, mmp_f, tmp_f);
-    DtxqcdPrecisionChange(out, mmp_f);
+    DtxqcdPrecisionChange(out, mmp_f, pc_maps);
     Axpy(out, pole, in);                 // out = (MdagM + pole) in  (SP matvec)
   };
 
@@ -134,12 +135,13 @@ inline void DTXQCDSingleShiftCGMixedPrec(
   GridBase *grid_f = &Mop_f.RbGrid();
   DTXQCDFermionDoubled r(grid), p(grid), Ap(grid), mmp(grid), tmp(grid);
   DTXQCDFermionDoubledF p_f(grid_f), mmp_f(grid_f), tmp_f(grid_f);
+  DtxqcdPrecisionMaps pc_maps(grid, grid_f);
 
   auto ApplyShiftSP = [&](const DTXQCDFermionDoubled &in,
                           DTXQCDFermionDoubled &out) {
-    DtxqcdPrecisionChange(p_f, in);
+    DtxqcdPrecisionChange(p_f, in, pc_maps);
     DtxqcdHermOpF(Mop_f, p_f, mmp_f, tmp_f);
-    DtxqcdPrecisionChange(out, mmp_f);
+    DtxqcdPrecisionChange(out, mmp_f, pc_maps);
     Axpy(out, pole, in);                 // out = (MdagM + pole) in  (SP matvec)
   };
   auto ApplyShiftDP = [&](const DTXQCDFermionDoubled &in,
@@ -214,6 +216,7 @@ inline void DTXQCDMultiShiftCGMixedPrec(
 
   DTXQCDFermionDoubled  r(grid), p(grid), mmp(grid), tmp(grid);
   DTXQCDFermionDoubledF p_f(grid_f), mmp_f(grid_f), tmp_f(grid_f);
+  DtxqcdPrecisionMaps pc_maps(grid, grid_f);
   std::vector<DTXQCDFermionDoubled> ps;
   ps.reserve(nshift);
   for (int s = 0; s < nshift; ++s) ps.emplace_back(grid);
@@ -239,9 +242,9 @@ inline void DTXQCDMultiShiftCGMixedPrec(
   p = src;
 
   // First HermOp at single precision.
-  DtxqcdPrecisionChange(p_f, p);
+  DtxqcdPrecisionChange(p_f, p, pc_maps);
   DtxqcdHermOpF(Mop_f, p_f, mmp_f, tmp_f);
-  DtxqcdPrecisionChange(mmp, mmp_f);
+  DtxqcdPrecisionChange(mmp, mmp_f, pc_maps);
   RealD d = real(innerProduct(p, mmp));
   Axpy(mmp, poles[0], p);
   RealD rn = norm2(p);
@@ -324,13 +327,13 @@ inline void DTXQCDMultiShiftCGMixedPrec(
 
     // ---- Single-precision MdagM apply (the dominant per-iteration cost) ----
     PrecChangeTimer.Start();
-    DtxqcdPrecisionChange(p_f, p);
+    DtxqcdPrecisionChange(p_f, p, pc_maps);
     PrecChangeTimer.Stop();
     MatrixTimer.Start();
     DtxqcdHermOpF(Mop_f, p_f, mmp_f, tmp_f);
     MatrixTimer.Stop();
     PrecChangeTimer.Start();
-    DtxqcdPrecisionChange(mmp, mmp_f);
+    DtxqcdPrecisionChange(mmp, mmp_f, pc_maps);
     PrecChangeTimer.Stop();
 
     d = real(innerProduct(p, mmp));
