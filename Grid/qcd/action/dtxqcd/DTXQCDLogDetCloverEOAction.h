@@ -130,7 +130,9 @@ class DTXQCDLogDetCloverEOAction : public Action<DTXQCDField> {
     constexpr int N2 = N * N;
 
     // Forward M_ee per LOCAL even site (no peekSite -> parallel thread_for).
-    std::vector<std::complex<double>> h_fwd((size_t)nsites * N2);
+    std::vector<std::complex<double>> h_fwd_vec;  // DTXQCD_PINNED_STAGING=0 only
+    std::complex<double> *h_fwd =
+        DtxqcdBlas::BatchedInverse48::HostStaging(nsites, h_fwd_vec);
     thread_for(idx, nsites, {
       Eigen::MatrixXcd M48;
       BuildSiteMatrix48Local(L, idx, M48);  // column-major storage
@@ -139,7 +141,7 @@ class DTXQCDLogDetCloverEOAction : public Action<DTXQCDField> {
     });
 
     DtxqcdBlas::BatchedInverse48::Ensure(nsites, /*need_inv=*/false);
-    acceleratorCopyToDevice((void *)h_fwd.data(),
+    acceleratorCopyToDevice((void *)h_fwd,
                             (void *)&DtxqcdBlas::BatchedInverse48::M_fwd[0],
                             (size_t)nsites * N2 * sizeof(ComplexD));
     DtxqcdBlas::BatchedInverse48::FactorLU(nsites);  // M_fwd <- LU in place
@@ -357,7 +359,9 @@ class DTXQCDLogDetCloverEOAction : public Action<DTXQCDField> {
     using DtxqcdSiteForceKernel::PSobj;
 
     // Forward M_ee per LOCAL even site -> one batched cuBLAS getrf+getri.
-    std::vector<std::complex<double>> h_fwd((size_t)Nsite * N2);
+    std::vector<std::complex<double>> h_fwd_vec;  // DTXQCD_PINNED_STAGING=0 only
+    std::complex<double> *h_fwd =
+        DtxqcdBlas::BatchedInverse48::HostStaging(Nsite, h_fwd_vec);
     thread_for(idx, Nsite, {
       Eigen::MatrixXcd M48;
       BuildSiteMatrix48Local(L, idx, M48);  // column-major storage
@@ -366,13 +370,15 @@ class DTXQCDLogDetCloverEOAction : public Action<DTXQCDField> {
     });
     double t_l2 = usecond();
     DtxqcdBlas::BatchedInverse48::Ensure(Nsite, /*need_inv=*/true);
-    acceleratorCopyToDevice((void *)h_fwd.data(),
+    acceleratorCopyToDevice((void *)h_fwd,
                             (void *)&DtxqcdBlas::BatchedInverse48::M_fwd[0],
                             (size_t)Nsite * N2 * sizeof(ComplexD));
     DtxqcdBlas::BatchedInverse48::Invert(Nsite);
-    std::vector<std::complex<double>> h_inv((size_t)Nsite * N2);
+    std::vector<std::complex<double>> h_inv_vec;  // DTXQCD_PINNED_STAGING=0 only
+    std::complex<double> *h_inv =
+        DtxqcdBlas::BatchedInverse48::HostStaging(Nsite, h_inv_vec);
     acceleratorCopyFromDevice((void *)&DtxqcdBlas::BatchedInverse48::M_inv[0],
-                              (void *)h_inv.data(),
+                              (void *)h_inv,
                               (size_t)Nsite * N2 * sizeof(ComplexD));
     double t_l3 = usecond();
 

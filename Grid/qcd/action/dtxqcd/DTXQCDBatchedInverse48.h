@@ -70,6 +70,42 @@ struct BatchedInverse48 {
     if (grow) cap_nsites = nsites;
   }
 
+  // DTXQCD_PINNED_STAGING (default 1): one pinned host buffer of nsites*N2
+  // complex doubles, allocated once and reused by every caller for the
+  // host-built forward matrices and the device->host inverse.  The callers
+  // made a fresh std::vector per call instead: 906 MB per rank at 16^3x48,
+  // zero-filled on one thread, page-faulted, and copied from pageable memory.
+  // Every element is written before it is read (the build fills each site,
+  // the copy fills the buffer), so the bytes are the same: bit-identical to
+  // =0, which returns `fallback` sized as before.  One buffer: a caller is
+  // done with its forward matrices (copied to M_fwd) before it reads back
+  // the inverse into the same buffer.
+  static bool PinnedStagingOn() {
+    static const bool on = []() {
+      const char *e = std::getenv("DTXQCD_PINNED_STAGING");
+      return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
+  }
+  inline static std::complex<double> *h_stage{nullptr};
+  inline static uint64_t h_stage_cap{0};
+
+  static std::complex<double> *HostStaging(
+      uint64_t nsites, std::vector<std::complex<double>> &fallback) {
+    const uint64_t need = nsites * (uint64_t)N2;
+    if (!PinnedStagingOn()) {
+      fallback.resize(need);
+      return fallback.data();
+    }
+    if (h_stage_cap < need) {
+      if (h_stage) cudaFreeHost(h_stage);  // Grid's acceleratorFreeHost calls cudaFree
+      h_stage = (std::complex<double> *)acceleratorAllocHost(
+          need * sizeof(std::complex<double>));
+      h_stage_cap = need;
+    }
+    return h_stage;
+  }
+
   // getrf only: leaves the LU factors (U on the diagonal) in M_fwd.  S_gpu
   // reads sum_k log|U_kk| over the LU diagonal for log|det|.
   static void FactorLU(uint64_t nsites) {

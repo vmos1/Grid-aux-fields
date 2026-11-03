@@ -690,7 +690,9 @@ class DTXQCDWilsonCloverFermionEO {
 #ifdef GRID_CUDA
     if (use_gpu) {
       const int N = kDim48, N2 = N * N;
-      std::vector<std::complex<double>> h_fwd((size_t)Nsite * N2);
+      std::vector<std::complex<double>> h_fwd_vec;  // DTXQCD_PINNED_STAGING=0 only
+      std::complex<double> *h_fwd =
+          DtxqcdBlas::BatchedInverse48::HostStaging(Nsite, h_fwd_vec);
       thread_for(idx, Nsite, {
         Eigen::MatrixXcd M48;
         build_M48(idx, M48);                   // Eigen storage is column-major
@@ -707,7 +709,7 @@ class DTXQCDWilsonCloverFermionEO {
       });
       t_c_b1 = usecond();
       DtxqcdBlas::BatchedInverse48::Ensure(Nsite, /*need_inv=*/true);
-      acceleratorCopyToDevice((void *)h_fwd.data(),
+      acceleratorCopyToDevice((void *)h_fwd,
                               (void *)&DtxqcdBlas::BatchedInverse48::M_fwd[0],
                               (size_t)Nsite * N2 * sizeof(ComplexD));
       if (reuse_dev) {
@@ -730,9 +732,11 @@ class DTXQCDWilsonCloverFermionEO {
                                       (size_t)Nsite * N2 * sizeof(ComplexD));
       }
       if (!sobjs.empty()) {
-        std::vector<std::complex<double>> h_inv((size_t)Nsite * N2);
+        std::vector<std::complex<double>> h_inv_vec;  // DTXQCD_PINNED_STAGING=0 only
+        std::complex<double> *h_inv =
+            DtxqcdBlas::BatchedInverse48::HostStaging(Nsite, h_inv_vec);
         acceleratorCopyFromDevice((void *)&DtxqcdBlas::BatchedInverse48::M_inv[0],
-                                  (void *)h_inv.data(),
+                                  (void *)h_inv,
                                   (size_t)Nsite * N2 * sizeof(ComplexD));
         t_c_gpu = usecond();
         thread_for(idx, Nsite, {
