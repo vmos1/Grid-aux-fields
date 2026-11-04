@@ -102,14 +102,54 @@ inline RealD norm2(const DTXQCDField &F) {
        + norm2(F.s) + norm2(F.p);
 }
 
+// DTXQCD_FAST_MAXNORM (default 1): Grid's maxLocalNorm2 scans localNorm2 with
+// a serial host loop over every local site, one LocalIndexToLocalCoor and one
+// peekLocalSite (a host view open) per site: ~2 ms per field at 16^3x48.  The
+// integrator calls it on the force and on the level total of every momentum
+// update, here on all seven fields of the composite (~1000 updates per
+// trajectory).  DtxqcdMaxLocalNorm2 takes the same localNorm2, opens it on the
+// host once and scans every lane of every outer site.  A maximum does not
+// depend on the scan order: the same value.  =0 calls Grid's maxLocalNorm2.
+inline bool DtxqcdFastMaxNormOn() {
+  static const bool on = []() {
+    const char *e = std::getenv("DTXQCD_FAST_MAXNORM");
+    return !(e && *e && std::atoi(e) == 0);
+  }();
+  return on;
+}
+
+template <class vobj>
+inline RealD DtxqcdMaxLocalNorm2(const Lattice<vobj> &arg) {
+  if (!DtxqcdFastMaxNormOn()) return maxLocalNorm2(arg);
+  typedef typename vobj::tensor_reduced vscalar;  // iScalar<...<vector>>
+  typedef typename vscalar::scalar_type scalar_type;
+  constexpr int Nsimd = vscalar::Nsimd();
+  Lattice<vscalar> inner = localNorm2(arg);
+  GridBase *grid = arg.Grid();
+  const uint64_t osites = grid->oSites();
+  RealD max = 0.0;
+  {
+    autoView(inner_v, inner, CpuRead);
+    for (uint64_t o = 0; o < osites; ++o) {
+      const scalar_type *v = (const scalar_type *)&inner_v[o];
+      for (int l = 0; l < Nsimd; ++l) {
+        const RealD r = real(v[l]);
+        if ((o == 0 && l == 0) || r > max) max = r;
+      }
+    }
+  }
+  grid->GlobalMax(max);
+  return max;
+}
+
 inline RealD maxLocalNorm2(const DTXQCDField &F) {
-  RealD m = maxLocalNorm2(F.U);
-  m = std::max(m, maxLocalNorm2(F.sigma));
-  m = std::max(m, maxLocalNorm2(F.pi));
-  m = std::max(m, maxLocalNorm2(F.d));
-  m = std::max(m, maxLocalNorm2(F.n));
-  m = std::max(m, maxLocalNorm2(F.s));
-  m = std::max(m, maxLocalNorm2(F.p));
+  RealD m = DtxqcdMaxLocalNorm2(F.U);
+  m = std::max(m, DtxqcdMaxLocalNorm2(F.sigma));
+  m = std::max(m, DtxqcdMaxLocalNorm2(F.pi));
+  m = std::max(m, DtxqcdMaxLocalNorm2(F.d));
+  m = std::max(m, DtxqcdMaxLocalNorm2(F.n));
+  m = std::max(m, DtxqcdMaxLocalNorm2(F.s));
+  m = std::max(m, DtxqcdMaxLocalNorm2(F.p));
   return m;
 }
 

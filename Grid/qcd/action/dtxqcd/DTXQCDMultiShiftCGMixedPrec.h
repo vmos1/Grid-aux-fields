@@ -125,11 +125,15 @@ inline bool DTXQCDSingleShiftCGSpCleanup(
 //   tol (SP residual floor ~1e-7).  Much cheaper than a full DP multishift:
 //   one shift, warm-started, SP matvec.  Mirrors Grid's
 //   MixedPrecisionConjugateGradient cleanup but on the doubled field.
+//   mmp0 (optional): (M^dag M + pole) x already computed by the caller in DP
+//   for this x; it replaces the starting ApplyShiftDP (same operator, same x:
+//   the same vector).
 template <class DTXQCDMopD, class DTXQCDMopF>
 inline void DTXQCDSingleShiftCGMixedPrec(
     DTXQCDMopD &Mop_d, DTXQCDMopF &Mop_f, RealD pole, RealD tol,
     const DTXQCDFermionDoubled &src, DTXQCDFermionDoubled &x,
-    int MaxIter, int ReliableUpdateFreq) {
+    int MaxIter, int ReliableUpdateFreq,
+    const DTXQCDFermionDoubled *mmp0 = nullptr) {
   using namespace dtxqcd_msshift_detail;
   GridBase *grid   = src.Grid();
   GridBase *grid_f = &Mop_f.RbGrid();
@@ -151,7 +155,8 @@ inline void DTXQCDSingleShiftCGMixedPrec(
   };
 
   // True initial residual in DP (warm start from x).
-  ApplyShiftDP(x, mmp);
+  if (mmp0) mmp = *mmp0;
+  else      ApplyShiftDP(x, mmp);
   for (int a = 0; a < DtxqcdNf; ++a) {
     r.upper.f[a] = src.upper.f[a] - mmp.upper.f[a];
     r.lower.f[a] = src.lower.f[a] - mmp.lower.f[a];
@@ -460,6 +465,13 @@ inline void DTXQCDMultiShiftCGMixedPrec(
         return;
       }
       // Legacy path: per-shift DP probe + MP cleanup (with DP reliable update inside).
+      // DTXQCD_CLEANUP_REUSE_PROBE (default 1): the cleanup starts from the
+      // probe's (M^dag M + pole) psi[s] instead of recomputing it (one DP
+      // HermOp per cleaned shift, ~10 per solve); =0 recomputes.
+      static const bool reuse_probe = []() {
+        const char *e = std::getenv("DTXQCD_CLEANUP_REUSE_PROBE");
+        return !(e && *e && std::atoi(e) == 0);
+      }();
       for (int s = 0; s < nshift; ++s) {
         RealD dd = DtxqcdHermOpD(Mop_d, psi[s], mmp, tmp);
         (void)dd;
@@ -472,7 +484,8 @@ inline void DTXQCDMultiShiftCGMixedPrec(
         if (true_resid > tol[s]) {
           ++n_cleanup;
           DTXQCDSingleShiftCGMixedPrec(Mop_d, Mop_f, poles[s], tol[s], src,
-                                       psi[s], MaxIter, ReliableUpdateFreq);
+                                       psi[s], MaxIter, ReliableUpdateFreq,
+                                       reuse_probe ? &mmp : nullptr);
         }
       }
       std::cout << GridLogMessage
