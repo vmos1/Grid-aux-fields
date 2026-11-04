@@ -144,6 +144,54 @@ struct DtxqcdPrecisionMaps {
   }
 };
 
+// DTXQCD_PC_LANE_KERNEL (default 1): the copy itself.  Grid's workspace
+// precisionChange runs one thread per output site looping over its lanes
+// (~32 us per LatticeFermion at 16^3x48, ~6x the bytes moved).  This kernel
+// runs one thread per (output site, vector word, lane) with the same map and
+// the same per-element conversion as Grid's copyLane (otmp = itmp), so the
+// same bits.  =0 calls Grid's precisionChange with the workspace.
+inline bool DtxqcdPcLaneKernelOn() {
+  static const bool on = []() {
+    const char *e = std::getenv("DTXQCD_PC_LANE_KERNEL");
+    return !(e && *e && std::atoi(e) == 0);
+  }();
+  return on;
+}
+
+template <class VobjOut, class VobjIn>
+inline void DtxqcdPrecisionChangeLanes(Lattice<VobjOut> &out,
+                                       const Lattice<VobjIn> &in,
+                                       const precisionChangeWorkspace &wk) {
+  if (!DtxqcdPcLaneKernelOn()) {
+    precisionChange(out, in, wk);
+    return;
+  }
+  typedef typename VobjOut::vector_type ovector_type;
+  typedef typename VobjIn::vector_type  ivector_type;
+  typedef typename VobjOut::scalar_type oscalar_type;
+  typedef typename VobjIn::scalar_type  iscalar_type;
+  constexpr int Nsimd_out = VobjOut::Nsimd();
+  constexpr int words = sizeof(VobjOut) / sizeof(ovector_type);
+  static_assert(words == sizeof(VobjIn) / sizeof(ivector_type),
+                "DtxqcdPrecisionChangeLanes: word counts differ");
+  out.Checkerboard() = in.Checkerboard();
+  wk.checkGrids(out.Grid(), in.Grid());
+  const std::pair<Integer, Integer> *fmap = wk.getMap();
+  autoView(out_v, out, AcceleratorWrite);
+  autoView(in_v, in, AcceleratorRead);
+  accelerator_for(idx, out.Grid()->oSites() * words, Nsimd_out, {
+    const uint64_t oo = idx / words;
+    const int w = (int)(idx % words);
+    const int lane = acceleratorSIMTlane(Nsimd_out);
+    const std::pair<Integer, Integer> m = fmap[oo * Nsimd_out + lane];
+    const ivector_type *ip = (const ivector_type *)&in_v[m.first];
+    ovector_type *op = (ovector_type *)&out_v[oo];
+    iscalar_type itmp = ip[w].getlane(m.second);
+    oscalar_type otmp = itmp;  // the precision change, as in copyLane
+    op[w].putlane(otmp, lane);
+  });
+}
+
 inline void DtxqcdPrecisionChange(DTXQCDFermionDoubledF &out,
                                   const DTXQCDFermionDoubled &in,
                                   const DtxqcdPrecisionMaps &maps) {
@@ -152,8 +200,8 @@ inline void DtxqcdPrecisionChange(DTXQCDFermionDoubledF &out,
     return;
   }
   for (int a = 0; a < DtxqcdNf; ++a) {
-    precisionChange(out.upper.f[a], in.upper.f[a], *maps.to_f);
-    precisionChange(out.lower.f[a], in.lower.f[a], *maps.to_f);
+    DtxqcdPrecisionChangeLanes(out.upper.f[a], in.upper.f[a], *maps.to_f);
+    DtxqcdPrecisionChangeLanes(out.lower.f[a], in.lower.f[a], *maps.to_f);
     out.upper.f[a].Checkerboard() = in.upper.f[a].Checkerboard();
     out.lower.f[a].Checkerboard() = in.lower.f[a].Checkerboard();
   }
@@ -167,8 +215,8 @@ inline void DtxqcdPrecisionChange(DTXQCDFermionDoubled &out,
     return;
   }
   for (int a = 0; a < DtxqcdNf; ++a) {
-    precisionChange(out.upper.f[a], in.upper.f[a], *maps.to_d);
-    precisionChange(out.lower.f[a], in.lower.f[a], *maps.to_d);
+    DtxqcdPrecisionChangeLanes(out.upper.f[a], in.upper.f[a], *maps.to_d);
+    DtxqcdPrecisionChangeLanes(out.lower.f[a], in.lower.f[a], *maps.to_d);
     out.upper.f[a].Checkerboard() = in.upper.f[a].Checkerboard();
     out.lower.f[a].Checkerboard() = in.lower.f[a].Checkerboard();
   }

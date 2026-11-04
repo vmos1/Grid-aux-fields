@@ -326,6 +326,20 @@ class DTXQCDWilsonCloverFermionEO {
     return on;
   }
 
+  // DTXQCD_INVN_DAG_G5PACK (default 1, with the device pack above): the
+  // dagger multi-RHS Mooee^{-1} applies its gamma_5 inside the device pack and
+  // unpack instead of building 2*NRHS gamma_5-multiplied temporaries (96
+  // lattice fermions at 12 poles; ~54 ms per force call against ~3 ms for
+  // the forward apply).  Exact sign flips: bit-identical.  =0 restores the
+  // temporaries.
+  static bool InvNDagG5Pack() {
+    static const bool on = []() {
+      const char *e = std::getenv("DTXQCD_INVN_DAG_G5PACK");
+      return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
+  }
+
   // DTXQCD_PACK_ON_DEVICE (default 1, needs the GPU build and
   // ReuseSiteMatrices): fill the SIMD caches inv_e_/o_ and fwd_e_/o_ on the
   // device straight from the column-major batched matrices, instead of copying
@@ -991,8 +1005,12 @@ class DTXQCDWilsonCloverFermionEO {
   // rhs k, row r) at buf[(lex*NRHS + k)*48 + r], rows 0..23 upper (a, alpha,
   // i), 24..47 lower -- the placement of its host loops.  One thread per
   // (outer site, row, SIMD lane); data movement only.
+  // g5 = true applies gamma_5 on the way: Grid's chiral gamma_5 negates spin
+  // components 2 and 3 (multGamma5), and negation is exact, so packing with
+  // the sign equals packing g5 * in (and unpacking with it equals g5 * out).
   static void PackFermionToFlat(const Field &in, int k, int NRHS,
-                                const uint64_t *lex_of, ComplexD *buf) {
+                                const uint64_t *lex_of, ComplexD *buf,
+                                bool g5 = false) {
     constexpr int N = kDim48, N24 = kDim24, NsNc = Ns * Nc;
     constexpr int Nsimd = LatticeFermion::vector_object::Nsimd();
     typedef typename LatticeFermion::vector_object::scalar_type Scalar;
@@ -1007,12 +1025,14 @@ class DTXQCDWilsonCloverFermionEO {
       const uint64_t lex = lex_of[ss * Nsimd + l];
       const Scalar *p = (r < N24) ? (const Scalar *)&up_v[a][ss]()(alpha)(ic)
                                   : (const Scalar *)&lo_v[a][ss]()(alpha)(ic);
-      buf[(lex * NRHS + k) * N + r] = *(const ComplexD *)&p[l];
+      const ComplexD v = *(const ComplexD *)&p[l];
+      buf[(lex * NRHS + k) * N + r] = (g5 && alpha >= 2) ? -v : v;
     });
     for (int a = 0; a < DtxqcdNf; ++a) { up_v[a].ViewClose(); lo_v[a].ViewClose(); }
   }
   static void UnpackFlatToFermion(const ComplexD *buf, int k, int NRHS,
-                                  const uint64_t *lex_of, Field &out) {
+                                  const uint64_t *lex_of, Field &out,
+                                  bool g5 = false) {
     constexpr int N = kDim48, N24 = kDim24, NsNc = Ns * Nc;
     constexpr int Nsimd = LatticeFermion::vector_object::Nsimd();
     typedef typename LatticeFermion::vector_object::scalar_type Scalar;
@@ -1027,7 +1047,8 @@ class DTXQCDWilsonCloverFermionEO {
       const uint64_t lex = lex_of[ss * Nsimd + l];
       Scalar *p = (r < N24) ? (Scalar *)&up_v[a][ss]()(alpha)(ic)
                             : (Scalar *)&lo_v[a][ss]()(alpha)(ic);
-      p[l] = *(const Scalar *)&buf[(lex * NRHS + k) * N + r];
+      const Scalar v = *(const Scalar *)&buf[(lex * NRHS + k) * N + r];
+      p[l] = (g5 && alpha >= 2) ? -v : v;
     });
     for (int a = 0; a < DtxqcdNf; ++a) { up_v[a].ViewClose(); lo_v[a].ViewClose(); }
   }
@@ -1207,7 +1228,8 @@ class DTXQCDWilsonCloverFermionEO {
   // and D2H + host unpack + vectorize.  The same gemmBatched on the same
   // bytes, so the same result.
   void ApplyInverseLexDevice(const std::vector<const Field *> &ins,
-                             const std::vector<Field *> &outs, int cb) {
+                             const std::vector<Field *> &outs, int cb,
+                             bool g5 = false) {
     const int NRHS = static_cast<int>(ins.size());
     const int N = kDim48;
     const int Nmat = N * N;
@@ -1238,7 +1260,7 @@ class DTXQCDWilsonCloverFermionEO {
     }
     const uint64_t *lex_of = LexOfOuterLane(&rbgrid_);
     for (int k = 0; k < NRHS; ++k)
-      PackFermionToFlat(*ins[k], k, NRHS, lex_of, &fin_dev[0]);
+      PackFermionToFlat(*ins[k], k, NRHS, lex_of, &fin_dev[0], g5);
 
     bool need_rebuild = (ptrs_gen != inv_gen)
                      || (ptrs_NRHS != NRHS)
@@ -1278,7 +1300,7 @@ class DTXQCDWilsonCloverFermionEO {
     blas.synchronise();  // the host path's D2H copy waited for the gemm
 
     for (int k = 0; k < NRHS; ++k) {
-      UnpackFlatToFermion(&fout_dev[0], k, NRHS, lex_of, *outs[k]);
+      UnpackFlatToFermion(&fout_dev[0], k, NRHS, lex_of, *outs[k], g5);
       for (int a = 0; a < DtxqcdNf; ++a) {
         outs[k]->upper.f[a].Checkerboard() = cb;
         outs[k]->lower.f[a].Checkerboard() = cb;
@@ -1297,6 +1319,12 @@ class DTXQCDWilsonCloverFermionEO {
     const int cb = ins[0]->upper.f[0].Checkerboard();
     GRID_ASSERT(ins[0]->upper.f[0].Grid() == &rbgrid_);
 
+#ifdef GRID_CUDA
+    if (dag && UseMooeeInvCublas() && InvNDevicePack() && InvNDagG5Pack()) {
+      ApplyInverseLexDevice(ins, outs, cb, /*g5=*/true);
+      return;
+    }
+#endif
     if (dag) {
       // Wrap in gamma_5 on each RHS and recurse with dag=false.
       Gamma g5(Gamma::Algebra::Gamma5);
