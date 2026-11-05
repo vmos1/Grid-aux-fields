@@ -69,8 +69,18 @@ run_one() { # <name> <binary> [VAR=value ...]  (the generator writes cfgs/ under
 }
 
 run_gens() {
-  say "==== generators tag=$TAG tree=$TREE HEAD=$(git -C "$TREE" rev-parse --short HEAD) $(date '+%Y-%m-%d %H:%M:%S %Z')"
   local gens=" ${GENS:-dtxqcd txqcd2p1} "
+  # A used tag must not run again: its generator directory holds the old run's
+  # checkpoints, which the generator resumes from, and its log (2026-11-04: a reused
+  # tag resumed a 10-29 run and overwrote its log). Checked before anything is written.
+  local g
+  for g in $gens; do
+    if [ -e "$OUT/$g" ]; then
+      echo "ERROR: $OUT/$g exists: tag $TAG was used before; pick a new TAG" >&2
+      exit 2
+    fi
+  done
+  say "==== generators tag=$TAG tree=$TREE HEAD=$(git -C "$TREE" rev-parse --short HEAD) $(date '+%Y-%m-%d %H:%M:%S %Z')"
   # DTXQCD: the canonical launcher's defaults (MN2, MDS 10, trajL sqrt2/4, gauge x8,
   # aux x1, saddle init, rational autoscale, cuBLAS paths) with QUDA off and a
   # 3-trajectory target of which the first is force-accepted.

@@ -58,6 +58,122 @@ inline void Set_Scaled(DTXQCDFermionDoubled &y, RealD coef,
   }
 }
 
+// DTXQCD_FUSED_SHIFT_UPDATE (default 1): the vector updates of the multishift
+// loops (p and ps[s] before the operator apply, psi[s] after it) were one Grid
+// expression per vector per fermion: ~90 kernels per iteration at 12 shifts,
+// each launched and synchronised on its own.  FusedShiftUpdate collects them
+// and runs one kernel that evaluates, per site lane, the same Grid expressions
+// on the same coalesced site objects as those expression kernels (Scale_Add
+// a*y + x, the ps update a*x + b*y, Axpy y + a*x), so the same bits.  =0
+// keeps the per-vector expressions.
+inline bool FusedShiftUpdateOn() {
+  static const bool on = []() {
+    const char *e = std::getenv("DTXQCD_FUSED_SHIFT_UPDATE");
+    return !(e && *e && std::atoi(e) == 0);
+  }();
+  return on;
+}
+
+enum FusedKind { kScaleAdd = 0, kShiftPs = 1, kAxpy = 2 };
+
+inline LatticeFermion &FermOf(DTXQCDFermionDoubled &f, int k) {
+  return (k < DtxqcdNf) ? f.upper.f[k] : f.lower.f[k - DtxqcdNf];
+}
+inline const LatticeFermion &FermOf(const DTXQCDFermionDoubled &f, int k) {
+  return (k < DtxqcdNf) ? f.upper.f[k] : f.lower.f[k - DtxqcdNf];
+}
+
+constexpr int kFusedMax = 32;              // updates per kernel
+constexpr int kFusedNFerm = 2 * DtxqcdNf;
+typedef LatticeFermion::vector_object FusedVobj;
+
+// Kernel arguments, captured by value (~2.7 KB).
+struct FusedShiftArgs {
+  FusedVobj *y[kFusedMax][kFusedNFerm];
+  FusedVobj *x[kFusedMax][kFusedNFerm];
+  RealD a[kFusedMax], b[kFusedMax];
+  int kind[kFusedMax];
+  int n;
+};
+
+class FusedShiftUpdate {
+ public:
+  static constexpr int kMax = kFusedMax;
+  static constexpr int kNFerm = kFusedNFerm;
+  typedef FusedVobj Vobj;
+
+  // y = a*y + x (kScaleAdd), a*x + b*y (kShiftPs), y + a*x (kAxpy)
+  void Add(DTXQCDFermionDoubled &y, const DTXQCDFermionDoubled &x,
+           FusedKind kind, RealD a, RealD b = 0.0) {
+    GRID_ASSERT(n_ < kMax);
+    y_[n_] = &y;
+    x_[n_] = &x;
+    kind_[n_] = kind;
+    a_[n_] = a;
+    b_[n_] = b;
+    ++n_;
+  }
+
+  void Run() {
+    if (n_ == 0) return;
+    FusedShiftArgs A;
+    std::vector<LatticeView<Vobj>> views;
+    views.reserve(2 * kMax * kNFerm);
+    // One read view per distinct x field (r is shared by all ps updates).
+    std::vector<const DTXQCDFermionDoubled *> xs;
+    std::vector<int> xslot;
+    for (int j = 0; j < n_; ++j) {
+      int slot = -1;
+      for (size_t i = 0; i < xs.size(); ++i)
+        if (xs[i] == x_[j]) slot = (int)i;
+      if (slot < 0) {
+        slot = (int)xs.size();
+        xs.push_back(x_[j]);
+        for (int k = 0; k < kNFerm; ++k)
+          views.push_back(FermOf(*x_[j], k).View(AcceleratorRead));
+      }
+      xslot.push_back(slot);
+    }
+    const size_t nx = views.size();
+    for (int j = 0; j < n_; ++j) {
+      for (int k = 0; k < kNFerm; ++k) {
+        views.push_back(FermOf(*y_[j], k).View(AcceleratorWrite));
+        A.y[j][k] = &views.back()[0];
+        A.x[j][k] = &views[(size_t)xslot[j] * kNFerm + k][0];
+      }
+      A.a[j] = a_[j];
+      A.b[j] = b_[j];
+      A.kind[j] = kind_[j];
+    }
+    A.n = n_;
+    GRID_ASSERT(views.size() == nx + (size_t)n_ * kNFerm);
+    const uint64_t osites = y_[0]->Grid()->oSites();
+    accelerator_for(idx, osites * kNFerm, Vobj::Nsimd(), {
+      const uint64_t ss = idx / kNFerm;
+      const int k = (int)(idx % kNFerm);
+      for (int j = 0; j < A.n; ++j) {
+        auto yy = coalescedRead(A.y[j][k][ss]);
+        auto xx = coalescedRead(A.x[j][k][ss]);
+        if (A.kind[j] == kScaleAdd)     coalescedWrite(A.y[j][k][ss], A.a[j] * yy + xx);
+        else if (A.kind[j] == kShiftPs) coalescedWrite(A.y[j][k][ss], A.a[j] * xx + A.b[j] * yy);
+        else                            coalescedWrite(A.y[j][k][ss], yy + A.a[j] * xx);
+      }
+    });
+    for (auto &v : views) v.ViewClose();
+    for (int j = 0; j < n_; ++j)
+      for (int k = 0; k < kNFerm; ++k)
+        FermOf(*y_[j], k).Checkerboard() = FermOf(*x_[j], k).Checkerboard();
+    n_ = 0;
+  }
+
+ private:
+  DTXQCDFermionDoubled *y_[kMax];
+  const DTXQCDFermionDoubled *x_[kMax];
+  FusedKind kind_[kMax];
+  RealD a_[kMax], b_[kMax];
+  int n_ = 0;
+};
+
 }  // namespace dtxqcd_msshift_detail
 
 template <class DTXQCDMop>
@@ -104,9 +220,12 @@ inline void DTXQCDMultiShiftCG(DTXQCDMop &Mop,
   // mmp = (M^dag M + poles[0]) p ; d = p^H mmp + poles[0] * ||p||^2
   Mop.M(p, tmp);
   Mop.Mdag(tmp, mmp);
-  RealD d = real(innerProduct(p, mmp));
+  // d = Re<p, mmp> before the shift is added; rn = |p|^2, one global sum.
+  ComplexD dc;
+  RealD rn;
+  DtxqcdInnerAndNorm2(p, mmp, dc, rn);
+  RealD d = real(dc);
   Axpy(mmp, poles[0], p);
-  RealD rn = norm2(p);
   d += rn * poles[0];
 
   RealD b = -cp / d;
@@ -146,6 +265,21 @@ inline void DTXQCDMultiShiftCG(DTXQCDMop &Mop,
   for (int k = 1; k <= MaxIter; ++k) {
     RealD aa = c / cp;
 
+    if (FusedShiftUpdateOn()) {
+      FusedShiftUpdate fu;
+      fu.Add(p, r, kScaleAdd, aa);
+      for (int s = 0; s < nshift; ++s) {
+        if (converged[s]) continue;
+        if (s == 0) {
+          fu.Add(ps[s], r, kScaleAdd, aa);
+        } else {
+          RealD as = aa * z[s][iz] * bs[s] / (z[s][1 - iz] * b);
+          RealD zc = z[s][iz];
+          fu.Add(ps[s], r, kShiftPs, zc, as);
+        }
+      }
+      fu.Run();
+    } else {
     Scale_Add(p, aa, r);
 
     for (int s = 0; s < nshift; ++s) {
@@ -164,6 +298,7 @@ inline void DTXQCDMultiShiftCG(DTXQCDMop &Mop,
         }
       }
     }
+    }
 
     RealD cp_prev = c;
     double t_op0 = 0;
@@ -171,9 +306,9 @@ inline void DTXQCDMultiShiftCG(DTXQCDMop &Mop,
     Mop.M(p, tmp);
     Mop.Mdag(tmp, mmp);
     if (cg_timing) { accelerator_barrier(); t_op += usecond() - t_op0; }
-    d = real(innerProduct(p, mmp));
+    DtxqcdInnerAndNorm2(p, mmp, dc, rn);
+    d = real(dc);
     Axpy(mmp, poles[0], p);
-    rn = norm2(p);
     d += rn * poles[0];
 
     RealD bp = b;
@@ -195,9 +330,18 @@ inline void DTXQCDMultiShiftCG(DTXQCDMop &Mop,
       bs[s] = b * z[s][iz] / z0;
     }
 
-    for (int s = 0; s < nshift; ++s) {
-      if (converged[s]) continue;
-      Axpy(psi[s], -bs[s] * alpha[s], ps[s]);
+    if (FusedShiftUpdateOn()) {
+      FusedShiftUpdate fu;
+      for (int s = 0; s < nshift; ++s) {
+        if (converged[s]) continue;
+        fu.Add(psi[s], ps[s], kAxpy, -bs[s] * alpha[s]);
+      }
+      fu.Run();
+    } else {
+      for (int s = 0; s < nshift; ++s) {
+        if (converged[s]) continue;
+        Axpy(psi[s], -bs[s] * alpha[s], ps[s]);
+      }
     }
 
     int all_converged = 1;

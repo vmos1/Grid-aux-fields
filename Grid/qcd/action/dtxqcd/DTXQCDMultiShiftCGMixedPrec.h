@@ -250,9 +250,13 @@ inline void DTXQCDMultiShiftCGMixedPrec(
   DtxqcdPrecisionChange(p_f, p, pc_maps);
   DtxqcdHermOpF(Mop_f, p_f, mmp_f, tmp_f);
   DtxqcdPrecisionChange(mmp, mmp_f, pc_maps);
-  RealD d = real(innerProduct(p, mmp));
+  // d = Re<p, mmp> before the shift is added; rn = |p|^2 (p is not changed
+  // by the Axpy), one global sum for both.
+  ComplexD dc;
+  RealD rn;
+  DtxqcdInnerAndNorm2(p, mmp, dc, rn);
+  RealD d = real(dc);
   Axpy(mmp, poles[0], p);
-  RealD rn = norm2(p);
   d += rn * poles[0];
 
   RealD b = -cp / d;
@@ -308,6 +312,25 @@ inline void DTXQCDMultiShiftCGMixedPrec(
   for (int k = 1; k <= MaxIter; ++k) {
     RealD aa = c / cp;
 
+    if (FusedShiftUpdateOn()) {
+      // p and every active ps[s] in one kernel (p counts as a shift update
+      // in the timers here).
+      if (cg_timing) ShiftTimer.Start();
+      FusedShiftUpdate fu;
+      fu.Add(p, r, kScaleAdd, aa);
+      for (int s = 0; s < nshift; ++s) {
+        if (converged[s]) continue;
+        if (s == 0) {
+          fu.Add(ps[s], r, kScaleAdd, aa);
+        } else {
+          RealD as = aa * z[s][iz] * bs[s] / (z[s][1 - iz] * b);
+          RealD zc = z[s][iz];
+          fu.Add(ps[s], r, kShiftPs, zc, as);
+        }
+      }
+      fu.Run();
+      if (cg_timing) { accelerator_barrier(); ShiftTimer.Stop(); }
+    } else {
     Scale_Add(p, aa, r);
 
     if (cg_timing) ShiftTimer.Start();
@@ -327,6 +350,7 @@ inline void DTXQCDMultiShiftCGMixedPrec(
       }
     }
     if (cg_timing) { accelerator_barrier(); ShiftTimer.Stop(); }
+    }
 
     RealD cp_prev = c;
 
@@ -341,9 +365,9 @@ inline void DTXQCDMultiShiftCGMixedPrec(
     DtxqcdPrecisionChange(mmp, mmp_f, pc_maps);
     PrecChangeTimer.Stop();
 
-    d = real(innerProduct(p, mmp));
+    DtxqcdInnerAndNorm2(p, mmp, dc, rn);
+    d = real(dc);
     Axpy(mmp, poles[0], p);
-    rn = norm2(p);
     d += rn * poles[0];
 
     RealD bp = b;
@@ -366,9 +390,18 @@ inline void DTXQCDMultiShiftCGMixedPrec(
     }
 
     if (cg_timing) ShiftTimer.Start();
-    for (int s = 0; s < nshift; ++s) {
-      if (converged[s]) continue;
-      Axpy(psi[s], -bs[s] * alpha[s], ps[s]);
+    if (FusedShiftUpdateOn()) {
+      FusedShiftUpdate fu;
+      for (int s = 0; s < nshift; ++s) {
+        if (converged[s]) continue;
+        fu.Add(psi[s], ps[s], kAxpy, -bs[s] * alpha[s]);
+      }
+      fu.Run();
+    } else {
+      for (int s = 0; s < nshift; ++s) {
+        if (converged[s]) continue;
+        Axpy(psi[s], -bs[s] * alpha[s], ps[s]);
+      }
     }
     if (cg_timing) { accelerator_barrier(); ShiftTimer.Stop(); }
 
