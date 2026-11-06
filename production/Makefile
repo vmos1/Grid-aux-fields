@@ -20,7 +20,12 @@ BREW_PREFIX ?= /opt/homebrew/opt
 # The source tree and the build directory come BEFORE grid-config's flags: those
 # carry -I<install prefix>/include, and an older `make install` there would
 # otherwise shadow the tree's headers (the aux-field include in ActionCore.h).
-CXXFLAGS = -I$(SRCDIR)/.. -I$(GRID_BUILD_DIR)/Grid $(shell $(GRID_CONFIG) --cxxflags) -I$(BREW_PREFIX)/openssl@3/include
+# The commit of the source tree at compile time, printed by the programs at start-up: the
+# aux-field code is header-only and compiled here, so Grid's own hash (libGrid's build
+# commit) does not identify it.  "-dirty" marks uncommitted changes to tracked files.
+PROG_GITHASH := $(shell git -C $(SRCDIR) describe --tags --always --dirty --long 2>/dev/null || echo unknown)
+CXXFLAGS = -I$(SRCDIR)/.. -I$(GRID_BUILD_DIR)/Grid $(shell $(GRID_CONFIG) --cxxflags) -I$(BREW_PREFIX)/openssl@3/include \
+           -DPROG_GITHASH=\"$(PROG_GITHASH)\"
 LDFLAGS  = -L$(GRID_BUILD_DIR)/Grid $(shell $(GRID_CONFIG) --ldflags) -L$(BREW_PREFIX)/openssl@3/lib
 LIBS     = $(shell $(GRID_CONFIG) --libs)
 

@@ -24,13 +24,15 @@ endif
 
 all: version-cache Version.h
 
+# git runs in the source directory: in an out-of-source build the build directory is not
+# inside the repository, git printed nothing and the hash came out undefined.
 version-cache:
-	@if [ `git status --porcelain | grep -v '??' | wc -l` -gt 0 ]; then\
+	@if [ `git -C $(srcdir) status --porcelain | grep -v '??' | wc -l` -gt 0 ]; then\
 		a="uncommited changes";\
 	else\
 		a="clean";\
 	fi;\
-	echo "`git log -n 1 --format=format:"#define GITHASH \\"%H:%d $$a\\"%n" HEAD`" > vertmp;\
+	echo "`git -C $(srcdir) log -n 1 --format=format:"#define GITHASH \\"%H:%d $$a\\"%n" HEAD`" > vertmp;\
 	if [ -e version-cache ]; then\
 		d=`diff vertmp version-cache`;\
 		if [ "$${d}" != "" ]; then\

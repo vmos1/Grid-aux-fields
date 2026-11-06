@@ -161,7 +161,9 @@ Timers, print only: `DTXQCD_CG_TIMING=1`, `DTXQCD_FORCE_TIMING=1`, `DTXQCD_EO_TI
   host memory is short.
 - Only `gen_dtxqcd_cfgs` is optimised. The TXQCD generators and the measurement programs
   build and run in pure Grid, but have not been timed.
-- Out-of-source builds print "Current Grid git commit hash is undefined"; note the commit
-  yourself.
+- Provenance: from the commit after `v4-txqcd`, the generator prints
+  `gen_dtxqcd_cfgs built from <tag>-<n>-g<hash>[-dirty]` at start-up (the commit it was
+  compiled from), and Grid's own "Current Grid git commit hash" line records libGrid's build
+  commit. Builds of `v4-txqcd` itself print "undefined" there; note the commit yourself.
 - Work continues on branch `pure-txqcd`. Every new speed-up follows the same rule
   (a switch, on by default, bit-identical), so `git pull` does not change results.

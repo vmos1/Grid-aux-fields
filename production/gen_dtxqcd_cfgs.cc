@@ -298,6 +298,9 @@ static void RunDtxqcdHMC(
 
 int main(int argc, char **argv) {
   Grid_init(&argc, &argv);
+#ifdef PROG_GITHASH
+  std::cout << GridLogMessage << "gen_dtxqcd_cfgs built from " << PROG_GITHASH << std::endl;
+#endif
   std::cout << GridLogMessage << "Grid threads: "
             << GridThread::GetThreads() << std::endl;
 
