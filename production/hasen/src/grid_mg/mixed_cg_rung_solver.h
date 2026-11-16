@@ -32,6 +32,7 @@
 
 #include <Grid/Grid.h>
 #include <Grid/algorithms/iterative/ConjugateGradientMixedPrec.h>
+#include <Grid/qcd/action/pseudofermion/hasen/fast_import.h>  // ImportGaugeDispatch
 
 #include "gauge_fingerprint.h"
 #include "rung_solver_base.h"
@@ -85,7 +86,10 @@ class MixedPrecCGRungSolver : public RungSolverBase {
     }
     GRID_ASSERT(U.Grid() == ws_in_);
     precisionChange(*UF_, U, *ws_);
-    opF_.ImportGauge(*UF_);
+    // The fork's import dispatch (hasen/fast_import.h): device clover build and inverse when
+    // HASEN_GRID_SHARE_FIELDSTRENGTH / HASEN_GRID_GPU_CLOVER_INV are on, the stock
+    // opF_.ImportGauge(*UF_) when both are off. opF_.Umu is the stock one on either path.
+    ImportGaugeDispatch(opF_, *UF_);
     ++imports_;
     Stamp st;
     st.gauge = fpU;

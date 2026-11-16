@@ -142,7 +142,13 @@ class TwoFlavourSchurCloverActionMP
       precisionChange(U_f, U_d);
       PokeIndex<LorentzIndex>(UmuF, U_f, mu);
     }
-    opF_.ImportGauge(UmuF);
+    // The fork's import dispatch (hasen/fast_import.h), as for the fp64 operator in Base::deriv:
+    // with HASEN_GRID_SHARE_FIELDSTRENGTH / HASEN_GRID_GPU_CLOVER_INV on, the fp32 clover term is
+    // built and inverted on the device; with both off it is the stock opF_.ImportGauge(UmuF).
+    // Stock here cost 0.93 s of host time per tail force call at 48^3 (0.57 s of it the Eigen
+    // clover inverse; call stacks of 2026-11-13). Not GuardedImportGauge: U is new at every
+    // deriv, so its skip test never hits and its shadow gauge field only takes device memory.
+    ImportGaugeDispatch(opF_, UmuF);
     Base::deriv(U, dSdU);
   }
 

@@ -36,6 +36,7 @@
 #pragma once
 
 #include <Grid/Grid.h>
+#include <Grid/qcd/action/pseudofermion/hasen/fast_import.h>  // ImportGaugeDispatch
 
 #include "gauge_fingerprint.h"
 #include "grid_mg_params.h"
@@ -423,7 +424,7 @@ class GridMGHierarchy {
  private:
   std::string Tag() const { return "[GridMG " + name_ + "] "; }
 
-  // The M2 SetGauge body: fp64 U -> persistent fp32 UmuF_ -> opF_.ImportGauge; ++generation.
+  // The M2 SetGauge body: fp64 U -> persistent fp32 UmuF_ -> import into opF_; ++generation.
   void ImportGaugeF(const LatticeGaugeField &U)
   {
     if (!ws_gauge_) {
@@ -432,7 +433,11 @@ class GridMGHierarchy {
     }
     GRID_ASSERT(U.Grid() == ws_gauge_in_);
     precisionChange(UmuF_, U, *ws_gauge_);
-    opF_.ImportGauge(UmuF_);
+    // The fork's import dispatch (hasen/fast_import.h): device clover build and inverse when
+    // HASEN_GRID_SHARE_FIELDSTRENGTH / HASEN_GRID_GPU_CLOVER_INV are on, the stock
+    // opF_.ImportGauge(UmuF_) when both are off. The doubled links (opF_.Umu) are the stock
+    // ones on either path, so the fingerprints of RecordGauge / Carries do not change.
+    ImportGaugeDispatch(opF_, UmuF_);
     ++generation_;
     if (!built_) needs_build_ = true;
     if (rebuild_pending_) needs_build_ = true;
