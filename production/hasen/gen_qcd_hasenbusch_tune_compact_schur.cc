@@ -50,6 +50,12 @@
 //                  ratio rungs, the tail and the strange MP RHMC accumulate their MooDeriv/MeeDeriv
 //                  outer products and run ONE clover-derivative pass per force call.  Unset,
 //                  empty or 0 = the per-call derivatives, byte-identical; other values exit(1).
+//   HASEN_GRID_RELIABLE_CG  1 = the light Grid mixed-precision CG solves (the tail's deriv and
+//                  the HASEN_GRID_MIXED_CG_* rungs) run ONE fp32 CG with fp64 reliable updates
+//                  (ConjugateGradientReliableUpdate) instead of restarted fp32 CGs and an fp64
+//                  patch-up; same fp64 clean-up CG, same tolerance.  HASEN_GRID_RELIABLE_CG_DELTA
+//                  in (0,1), default 0.01, on |r|^2 (= QUDA's delta 0.1, which acts on |r|).  Unset, empty
+//                  or 0 = MixedPrecisionConjugateGradient, byte-identical; other values exit(1).
 //   N_TRAJ         Number of trajectories (default 5)
 //   MDSTEPS        MD steps per trajectory (default 20)
 //   IMPORT_CFG     Path to starting gauge config (NERSC or Chroma LIME)
@@ -198,7 +204,15 @@ class TwoFlavourSchurCloverActionQudaTail
 #endif
 
 // ---------------------------------------------------------------------------
-// Mixed-precision CG wrapper — used for the strange RHMC force solver.
+// Mixed-precision CG wrapper.  Its one live instance is CG_light_md, the tail's
+// DerivativeSolver (TwoFlavourSchurCloverActionMP); CG_strange_md is built but
+// never called (the strange RHMC runs its own multishift).
+// reliable_delta > 0 (HASEN_GRID_RELIABLE_CG=1, CG_light_md only): the solve is
+// ONE ConjugateGradientReliableUpdate instead (ReliableUpdateCGSolve, see
+// grid_mg/mixed_cg_rung_solver.h for why and for the semantics), and prints the
+// MixedPrecCGRungSolver's line under the tag "[GridMixedCG <name>]": the tail has
+// no such line on the MPCG path, so this gives it per-solve counters there too.
+// reliable_delta = 0 (default) = MPCG, the code of before.
 // ---------------------------------------------------------------------------
 template <class FieldD, class FieldF, class SchurOpD, class SchurOpF>
 class MixedPrecCGWrapper : public OperatorFunction<FieldD> {
@@ -206,12 +220,29 @@ class MixedPrecCGWrapper : public OperatorFunction<FieldD> {
   using OperatorFunction<FieldD>::operator();
 
   MixedPrecCGWrapper(RealD tol, int max_inner, int max_outer,
-                     GridBase *rbgrid_f, SchurOpD &schur_d, SchurOpF &schur_f)
+                     GridBase *rbgrid_f, SchurOpD &schur_d, SchurOpF &schur_f,
+                     RealD reliable_delta = 0.0, std::string name = "")
       : tol_(tol), max_inner_(max_inner), max_outer_(max_outer),
-        rbgrid_f_(rbgrid_f), schur_d_(schur_d), schur_f_(schur_f) {}
+        rbgrid_f_(rbgrid_f), schur_d_(schur_d), schur_f_(schur_f),
+        reliable_delta_(reliable_delta), name_(std::move(name)) {
+    GRID_ASSERT(reliable_delta_ == 0.0 || (reliable_delta_ > 0.0 && reliable_delta_ < 1.0));
+  }
 
   void operator()(LinearOperatorBase<FieldD> &, const FieldD &src,
                   FieldD &sol) override {
+    if (reliable_delta_ > 0.0) {
+      const double t0 = usecond();
+      const ReliableCGResult r = ReliableUpdateCGSolve<FieldD, FieldF>(
+          tol_, max_inner_, reliable_delta_, rbgrid_f_, schur_f_, schur_d_, src, sol);
+      ++calls_;
+      std::cout << GridLogMessage << "[GridMixedCG " << name_ << "] solve " << calls_
+                << " inner " << r.fp32_iterations << " restarts " << r.reliable_updates
+                << " final_fp64 " << r.cleanup_iterations << " true_rel_residual "
+                << r.true_rel_residual << " tol " << tol_ << " seconds "
+                << (usecond() - t0) / 1.0e6 << " | reliable_update delta "
+                << reliable_delta_ << std::endl;
+      return;
+    }
     MixedPrecisionConjugateGradient<FieldD, FieldF> MPCG(
         tol_, max_inner_, max_outer_, rbgrid_f_, schur_f_, schur_d_);
     MPCG(src, sol);
@@ -221,6 +252,9 @@ class MixedPrecCGWrapper : public OperatorFunction<FieldD> {
   RealD tol_; int max_inner_, max_outer_;
   GridBase *rbgrid_f_;
   SchurOpD &schur_d_; SchurOpF &schur_f_;
+  RealD reliable_delta_;  // 0 = MPCG
+  std::string name_;
+  long long calls_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -487,6 +521,45 @@ int main(int argc, char **argv) {
                 << std::endl;
     } else if (s != "0") {
       std::cerr << "HASEN_GRID_FUSED_CLOVER_FORCE=" << v << ": must be 0 or 1.\n";
+      exit(1);
+    }
+  }
+
+  // ── HASEN_GRID_RELIABLE_CG: one reliable-update CG for the light mixed-CG solves ──────
+  // 1 = the light solves that run Grid's MixedPrecisionConjugateGradient -- the tail's deriv
+  // (CG_light_md, below) and every MixedPrecCGRungSolver (HASEN_GRID_MIXED_CG_RUNGS deriv + S,
+  // HASEN_GRID_MIXED_CG_HEATBATH_RUNGS heatbath) -- run ConjugateGradientReliableUpdate: ONE fp32
+  // CG whose residual is recomputed in fp64 whenever |r|^2 has fallen by
+  // HASEN_GRID_RELIABLE_CG_DELTA (default 0.01: QUDA's delta acts on |r|, so its 0.1 is 0.01 here;
+  // gated and timed at 0.01 and 0.1 on 11-16, same iterations, 0.01 marginally faster)
+  // since the last recomputation, then the same fp64 clean-up CG at the same tolerance as MPCG's
+  // patch-up.  Why: MPCG restarts the fp32 CG about twice per solve and each restart discards the
+  // Krylov space (has0: 1,950 iterations per solve vs QUDA's 1,484, tail 829 vs 635).  Same
+  // stopping test, so results agree to solver tolerance, not bitwise; semantics in
+  // grid_mg/mixed_cg_rung_solver.h.  Untouched: CG_deriv / CG_action (plain fp64 CG), the strange
+  // multishift, Grid-MG.  Strict parse: unset, empty or 0 = MPCG, byte-identical, nothing printed
+  // and the DELTA variable not read; 1 = on (one log line here); other values exit(1).
+  RealD grid_reliable_cg_delta = 0.0;  // 0 = off (the MixedPrecCG* solvers' MPCG)
+  if (const char *v = std::getenv("HASEN_GRID_RELIABLE_CG"); v && *v) {
+    const std::string s(v);
+    if (s == "1") {
+      grid_reliable_cg_delta = 0.01;
+      if (const char *d = std::getenv("HASEN_GRID_RELIABLE_CG_DELTA"); d && *d) {
+        char *end = nullptr;
+        grid_reliable_cg_delta = std::strtod(d, &end);
+        if (end == d || *end != '\0' ||
+            !(grid_reliable_cg_delta > 0.0 && grid_reliable_cg_delta < 1.0)) {
+          std::cerr << "HASEN_GRID_RELIABLE_CG_DELTA=" << d << ": must be a number in (0,1).\n";
+          exit(1);
+        }
+      }
+      std::cout << GridLogMessage
+                << "HASEN_GRID_RELIABLE_CG=1: light mixed-precision CG solves (tail deriv, "
+                   "HASEN_GRID_MIXED_CG_* rungs) = ConjugateGradientReliableUpdate, Delta="
+                << grid_reliable_cg_delta << " on |r|^2, fp32 iterations max " << cg_max
+                << ", fp64 clean-up CG at the same tol" << std::endl;
+    } else if (s != "0") {
+      std::cerr << "HASEN_GRID_RELIABLE_CG=" << v << ": must be 0 or 1.\n";
       exit(1);
     }
   }
@@ -905,14 +978,15 @@ int main(int argc, char **argv) {
           *GridMGH, cg_tol_act, Odd, "PF" + std::to_string(k) + " heatbath", /*donor=*/false);
       GridMGHeatbathSolver[k]->ImportIfHierarchyStale();
     }
+    // grid_reliable_cg_delta: 0 = MPCG, > 0 = reliable-update CG (HASEN_GRID_RELIABLE_CG).
     for (int k : grid_mixed_rungs)
       GridMixedRungSolver[k] = std::make_unique<MixedPrecCGRungSolver>(
           *LightOps[k], *LightOpsF[k], &RBGridF, cg_tol_drv, cg_max, 50,
-          "PF" + std::to_string(k) + " deriv/S");
+          "PF" + std::to_string(k) + " deriv/S", grid_reliable_cg_delta);
     for (int k : grid_mixed_hb_rungs)
       GridMixedHeatbathSolver[k] = std::make_unique<MixedPrecCGRungSolver>(
           *LightOps[k + 1], *LightOpsF[k + 1], &RBGridF, cg_tol_act, cg_max, 50,
-          "PF" + std::to_string(k) + " heatbath");
+          "PF" + std::to_string(k) + " heatbath", grid_reliable_cg_delta);
   }
 #ifdef GRID_HAVE_QUDA
   // Donor for HASEN_MG_SHARED_RUNGS = the lowest-index own-MG rung, set when
@@ -1127,7 +1201,11 @@ int main(int argc, char **argv) {
         std::ostringstream ds, hb;
         ds.precision(std::cout.precision());
         hb.precision(std::cout.precision());
-        if (GridMixedRungSolver[k])
+        if (GridMixedRungSolver[k] && grid_reliable_cg_delta > 0.0)
+          ds << "Grid reliable-update CG (one fp32 CG, fp64 reliable updates Delta="
+             << grid_reliable_cg_delta << ", fp64 clean-up; ONE solver for deriv AND S at "
+                "cg_tol_drv=" << cg_tol_drv << ", as the hybrid)";
+        else if (GridMixedRungSolver[k])
           ds << "Grid mixed-precision CG (fp32 inner CG, fp64 defect correction; ONE solver "
                 "for deriv AND S at cg_tol_drv=" << cg_tol_drv << ", as the hybrid)";
         else if (!GridMGRungSolver[k])
@@ -1141,6 +1219,9 @@ int main(int argc, char **argv) {
           hb << "Grid-MG shared (GCR at mass " << ladder[k+1] << ", rung " << grid_mg_donor
              << "'s hierarchy, tol " << cg_tol_act
              << ", imports the gauge if the hierarchy lacks it)";
+        else if (GridMixedHeatbathSolver[k] && grid_reliable_cg_delta > 0.0)
+          hb << "Grid reliable-update CG (one fp32 CG, Delta=" << grid_reliable_cg_delta
+             << ", mass " << ladder[k+1] << ", tol " << cg_tol_act << ")";
         else if (GridMixedHeatbathSolver[k])
           hb << "Grid mixed-precision CG (fp32 inner CG, mass " << ladder[k+1] << ", tol "
              << cg_tol_act << ")";
@@ -1161,13 +1242,16 @@ int main(int argc, char **argv) {
   // cg_tol_drv, action at cg_tol_act) to plain QUDA CG — the same QudaCGSchurSolver the
   // ratio rungs use.  The tail heatbath is an application (phi = Mpc^dag eta, no solve),
   // so it has no QUDA variant and stays identical across the two paths.
+  // CG_light_md serves the tail's deriv solve only (S = CG_action, the heatbath has no solve);
+  // HASEN_GRID_RELIABLE_CG=1 (grid_reliable_cg_delta > 0) makes it a reliable-update CG.
   int itail = n_ops - 1;
   SchurDifferentiableOperator<WilsonImplR> LightTailSchurD(*LightOps[itail]);
   SchurDifferentiableOperator<WilsonImplF> LightTailSchurF(*LightOpsF[itail]);
   MixedPrecCGWrapper<LatticeFermion, LatticeFermionF,
                      SchurDifferentiableOperator<WilsonImplR>,
                      SchurDifferentiableOperator<WilsonImplF>>
-      CG_light_md(cg_tol_drv, cg_max, 50, &RBGridF, LightTailSchurD, LightTailSchurF);
+      CG_light_md(cg_tol_drv, cg_max, 50, &RBGridF, LightTailSchurD, LightTailSchurF,
+                  grid_reliable_cg_delta, "tail deriv");
   std::unique_ptr<TwoFlavourSchurCloverActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>
       TailGrid;
 #ifdef GRID_HAVE_QUDA

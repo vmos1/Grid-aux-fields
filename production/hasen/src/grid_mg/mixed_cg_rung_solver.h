@@ -29,9 +29,26 @@
 // matches AND opF's links are still the ones that import produced (the second test catches
 // every importer outside the registry). A duplicate import of the same U is harmless anyway;
 // the skip only saves the fp32 clover rebuild. Cost of the test: two trace-sum reductions.
+//
+// Reliable-update route (driver switch HASEN_GRID_RELIABLE_CG=1, reliable_delta > 0 here and in
+// the driver's MixedPrecCGWrapper for the tail): the same (Mpc^dag Mpc)^-1 solve as ONE fp32 CG
+// with fp64 reliable updates, Grid's ConjugateGradientReliableUpdate, through
+// ReliableUpdateCGSolve below. WHY: MixedPrecisionConjugateGradient restarts its fp32 CG from the
+// fp64 residual (about twice per solve) and ends with a fresh fp64 CG, and every restart throws
+// the Krylov space away: has0 took 1,950 iterations per solve against QUDA's 1,484 with one
+// reliable-update CG. The reliable-update CG keeps its search direction across the fp64
+// residual recomputations. Its stopping criterion is MPCG's: both end in the same fp64
+// ConjugateGradient(tol, max_inner) from the mixed solution, which tests |r|^2 <= tol^2 |src|^2
+// on the true residual at entry and on its fp64 recursion after. Results agree to solver
+// tolerance, not bitwise. Delta compares SQUARED norms (|r|^2 < Delta max|r|^2 since the last
+// update), QUDA's delta plain norms: QUDA's delta 0.1 is Delta 0.01 here. max_inner caps the
+// TOTAL fp32 iterations (and the clean-up's); max_outer is not used. The class assert-aborts
+// when the fp32 loop runs out (ErrorOnNoConverge), where MPCG's inner CGs give up silently and
+// only its final fp64 CG aborts. reliable_delta = 0 (the default) = MPCG, the code of before.
 
 #include <Grid/Grid.h>
 #include <Grid/algorithms/iterative/ConjugateGradientMixedPrec.h>
+#include <Grid/algorithms/iterative/ConjugateGradientReliableUpdate.h>
 #include <Grid/qcd/action/pseudofermion/hasen/fast_import.h>  // ImportGaugeDispatch
 
 #include "gauge_fingerprint.h"
@@ -43,6 +60,48 @@
 
 namespace Grid {
 
+// One ConjugateGradientReliableUpdate solve, sol = (linop_d)^-1 src from the guess in sol, with
+// the counters the [GridMixedCG ...] line prints in MPCG's slots: inner = fp32 iterations of the
+// one CG, restarts = reliable updates (fp64 residual recomputations), final_fp64 = the fp64
+// clean-up CG's iterations (DoFinalCleanup, on by default).
+struct ReliableCGResult {
+  Integer fp32_iterations = 0;     // IterationsToComplete
+  Integer reliable_updates = 0;    // ReliableUpdatesPerformed
+  Integer cleanup_iterations = 0;  // IterationsToCleanup
+  RealD true_rel_residual = 0.0;   // |src - linop_d sol| / |src|, fp64, after the clean-up
+};
+
+template <class FieldD, class FieldF>
+ReliableCGResult ReliableUpdateCGSolve(RealD tol, Integer maxit, RealD delta, GridBase *rbgrid_f,
+                                       LinearOperatorBase<FieldF> &linop_f,
+                                       LinearOperatorBase<FieldD> &linop_d, const FieldD &src,
+                                       FieldD &sol)
+{
+  ConjugateGradientReliableUpdate<FieldD, FieldF> RUCG(tol, maxit, delta, rbgrid_f, linop_f,
+                                                       linop_d);
+  // The class returns early, counters unset, when the guess already meets tol (and the clean-up
+  // counter is never initialised): zero them so the log line cannot print garbage.
+  RUCG.IterationsToComplete = 0;
+  RUCG.ReliableUpdatesPerformed = 0;
+  RUCG.IterationsToCleanup = 0;
+  RUCG(src, sol);
+  ReliableCGResult r;
+  sol.Checkerboard() = src.Checkerboard();
+  r.fp32_iterations = RUCG.IterationsToComplete;
+  r.reliable_updates = RUCG.ReliableUpdatesPerformed;
+  r.cleanup_iterations = RUCG.IterationsToCleanup;
+  // The class computes the true residual (before its clean-up, and in the clean-up CG) but keeps
+  // neither, so recompute it: one fp64 Mpc^dag Mpc, MPCG's TrueResidual (its final CG's) to the
+  // letter. Diagnostic only, sol is final; its time (one matvec, ~2 fp32 iterations' worth) is
+  // inside the callers' "seconds", which, as on the MPCG path, runs from the call to the print.
+  FieldD res(src.Grid());
+  linop_d.HermOp(sol, res);
+  res = src - res;
+  const RealD ssq = norm2(src);
+  r.true_rel_residual = ssq > 0.0 ? std::sqrt(norm2(res) / ssq) : 0.0;
+  return r;
+}
+
 class MixedPrecCGRungSolver : public RungSolverBase {
  public:
   // The driver's WCF / WCF_f: the compact clover instantiations libGrid provides.
@@ -50,11 +109,14 @@ class MixedPrecCGRungSolver : public RungSolverBase {
   typedef CompactWilsonCloverFermion<WilsonImplF, CompactCloverHelpers<WilsonImplF>> WCF_f;
   using OperatorFunction<LatticeFermion>::operator();
 
+  // reliable_delta: 0 = MixedPrecisionConjugateGradient; in (0,1) = ConjugateGradientReliableUpdate
+  // with that Delta (HASEN_GRID_RELIABLE_CG, see the header comment).
   MixedPrecCGRungSolver(WCF &opD, WCF_f &opF, GridRedBlackCartesian *RBGridF, RealD tol,
-                        int max_inner, int max_outer, std::string name)
+                        int max_inner, int max_outer, std::string name, RealD reliable_delta = 0.0)
       : opD_(opD), opF_(opF), RBGridF_(RBGridF), tol_(tol), max_inner_(max_inner),
-        max_outer_(max_outer), name_(std::move(name))
+        max_outer_(max_outer), name_(std::move(name)), reliable_delta_(reliable_delta)
   {
+    GRID_ASSERT(reliable_delta_ == 0.0 || (reliable_delta_ > 0.0 && reliable_delta_ < 1.0));
     if (opF_.FermionRedBlackGrid() != (GridBase *)RBGridF_) {
       std::cout << GridLogError << Tag() << "opF was not built on the RBGridF passed in"
                 << std::endl;
@@ -103,6 +165,20 @@ class MixedPrecCGRungSolver : public RungSolverBase {
     const double t0 = usecond();
     SchurDiagMooeeOperator<WCF, LatticeFermion> sd(opD_);
     SchurDiagMooeeOperator<WCF_f, LatticeFermionF> sf(opF_);
+    if (reliable_delta_ > 0.0) {
+      // Same line, same fields, counters of the one reliable-update CG (ReliableCGResult); the
+      // trailing "| reliable_update delta" marks the solver.
+      const ReliableCGResult r = ReliableUpdateCGSolve<LatticeFermion, LatticeFermionF>(
+          tol_, max_inner_, reliable_delta_, RBGridF_, sf, sd, src, sol);
+      ++calls_;
+      std::cout << GridLogMessage << Tag() << "solve " << calls_ << " inner "
+                << r.fp32_iterations << " restarts " << r.reliable_updates << " final_fp64 "
+                << r.cleanup_iterations << " true_rel_residual " << r.true_rel_residual
+                << " tol " << tol_ << " seconds " << (usecond() - t0) / 1.0e6
+                << " | fp32 gauge imports " << imports_ << " skipped " << skips_
+                << " | reliable_update delta " << reliable_delta_ << std::endl;
+      return;
+    }
     MixedPrecisionConjugateGradient<LatticeFermion, LatticeFermionF> MPCG(
         tol_, max_inner_, max_outer_, RBGridF_, sf, sd);
     MPCG(src, sol);
@@ -142,6 +218,7 @@ class MixedPrecCGRungSolver : public RungSolverBase {
   RealD tol_;
   int max_inner_, max_outer_;
   std::string name_;
+  RealD reliable_delta_;  // 0 = MPCG
   std::unique_ptr<LatticeGaugeFieldF> UF_;  // persistent fp32 gauge, allocated at first import
   std::unique_ptr<precisionChangeWorkspace> ws_;
   GridBase *ws_in_ = nullptr;
