@@ -115,7 +115,13 @@ public:
     {
       int npoint = _geom.npoint;
     }
-    _A.resize(geom.npoint,CoarseGrid);
+    // Each link field constructed in place. _A.resize(npoint,CoarseGrid) built one field and
+    // copied it npoint times; the copy kernel of an nbasis x nbasis matrix field holds two site
+    // matrices per GPU thread, and CUDA keeps that stack reservation (8 GB of an A100 at
+    // nbasis 48, fp32) for the rest of the run (grid-perf-profile, 2026-11-16). A new Lattice is
+    // not initialised, so the copies only moved uninitialised memory: nothing else changes.
+    _A.reserve(geom.npoint);
+    for(int p=0;p<geom.npoint;p++) _A.emplace_back(CoarseGrid);
     //    _Adag.resize(geom.npoint,CoarseGrid);
   }
   void M (const CoarseVector &in, CoarseVector &out)
@@ -617,9 +623,11 @@ public:
       //      PopulateAdag();
     }
 
-    for(int p=0;p<geom.npoint;p++){
-      std::cout << " _A["<<p<<"] "<<norm2(_A[p])<<std::endl;
-    }
+    // A diagnostic print of norm2(_A[p]) for every point stood here. Its reduction kernel holds
+    // whole nbasis x nbasis site matrices in thread-local memory (55 KB per thread at nbasis 48,
+    // fp32), and CUDA keeps the largest stack reservation any kernel has asked for, for every
+    // thread the card can run, until the end of the program: 11.9 GB of an A100's 40 GB, taken
+    // by one log line (grid-perf-profile, 2026-11-16). Removed; nothing reads the value.
 
     // Need to write something to populate Adag from A
     ExchangeCoarseLinks();
@@ -632,8 +640,25 @@ public:
   }
 #endif  
   void ExchangeCoarseLinks(void){
+    // Was _A[p] = Cell.ExchangePeriodic(_A[p]). ExchangePeriodic copies its input once, and
+    // once more for every dimension that is not split over ranks (PaddedCell keeps the same
+    // grid there, so the "expansion" is a copy). The copy kernel of an nbasis x nbasis link
+    // field holds two site matrices in thread-local memory (37 KB per thread at nbasis 48),
+    // which reserves 8 GB of an A100 for the rest of the run. _A[p] is overwritten anyway:
+    // move it, and expand only the split dimensions with ExpandPeriodic's own steps for them
+    // (a new field on Cell.grids[d], Face_exchange into it), called here so that its copy
+    // branch is not even compiled for the link type. The same data lands on the same grids,
+    // so the result is bit-identical.
     for(int p=0;p<geom.npoint;p++){
-      _A[p] = Cell.ExchangePeriodic(_A[p]);
+      CoarseMatrix tmp = std::move(_A[p]);
+      for(int d=0;d<tmp.Grid()->Nd();d++){
+	if ( tmp.Grid()->_processors[d] > 1 ) {
+	  CoarseMatrix padded(Cell.grids[d]);
+	  Cell.Face_exchange(tmp,padded,d,Cell.depth);
+	  tmp = std::move(padded);
+	}
+      }
+      _A[p] = std::move(tmp);
       //      _Adag[p]= Cell.ExchangePeriodic(_Adag[p]);
     }
   }
