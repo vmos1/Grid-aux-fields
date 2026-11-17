@@ -760,6 +760,11 @@ RealD power_method_max(LinearOperatorBase<Field> &HermOp, GridParallelRNG &RNG, 
 
 // Site-wise transpose of a lattice of nbasis x nbasis matrices. A free function because CUDA
 // refuses an extended device lambda inside a constructor ("must allow its address to be taken").
+// Element by element: the first version read the whole site matrix into a local, built the
+// transpose in a second and wrote it (three 18 KB matrices per thread at nbasis 48, fp32), and
+// CUDA reserves the largest per-thread stack any kernel asks for, for every thread the card can
+// run, for the rest of the run: 11.9 GB of an A100 (grid-perf-profile, 2026-11-16). Each thread
+// now holds one complex number. Same element moves, so the result is bit-identical.
 template <class CComplex, int nbasis>
 void transpose_site_matrices(Lattice<iMatrix<CComplex, nbasis>> &dst,
                              const Lattice<iMatrix<CComplex, nbasis>> &src)
@@ -769,11 +774,9 @@ void transpose_site_matrices(Lattice<iMatrix<CComplex, nbasis>> &dst,
   autoView(src_v, src, AcceleratorRead);
   const int Nsimd = CComplex::Nsimd();
   accelerator_for(ss, src.Grid()->oSites(), Nsimd, {
-    auto s = coalescedRead(src_v[ss]);
-    auto t = s;
     for (int i = 0; i < nbasis; ++i)
-      for (int j = 0; j < nbasis; ++j) t(i, j) = s(j, i);
-    coalescedWrite(dst_v[ss], t);
+      for (int j = 0; j < nbasis; ++j)
+        coalescedWrite(dst_v[ss](i, j), coalescedRead(src_v[ss](j, i)));
   });
 }
 
@@ -816,10 +819,13 @@ public:
       // The general operator's links live on the PADDED grid after ExchangeCoarseLinks;
       // Extract returns the interior on Coarse4d, which is where op->A[point] lives.
       CoarseMatrix Aup = general.Cell.Extract(general._A[found]);
+      // Aup is a temporary: move it rather than copy it. A copy of an nbasis x nbasis link
+      // field is a kernel that reserves 8 GB of an A100 for thread stacks for the rest of the
+      // run (see transpose_site_matrices; grid-perf-profile, 2026-11-16).
       if (transposed)
         transpose_site_matrices<CComplex, nbasis>(op->A[point], Aup);
       else
-        op->A[point] = Aup;
+        op->A[point] = std::move(Aup);
     }
   }
   ~StencilCoarseApply()

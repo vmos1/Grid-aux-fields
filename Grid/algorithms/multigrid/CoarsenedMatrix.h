@@ -563,6 +563,19 @@ public:
     for(int p=0;p<npoint;p++) hAcceleratorViewContainer[p].ViewClose();
   }
   
+  // The link vectors are built with each field constructed in place. std::vector(n,&grid)
+  // built one field and copied it n times; the copy kernel of an nbasis x nbasis matrix field
+  // holds two site matrices per GPU thread, and CUDA keeps that stack reservation (8 GB of an
+  // A100 at nbasis 48, fp32) for the rest of the run (grid-perf-profile, 2026-11-16). A new
+  // Lattice is not initialised, so the copies only moved uninitialised memory.
+  static std::vector<CoarseMatrix> MakeLinks(int n, GridBase *grid)
+  {
+    std::vector<CoarseMatrix> links;
+    links.reserve(n);
+    for(int p=0;p<n;p++) links.emplace_back(grid);
+    return links;
+  }
+
   CoarsenedMatrix(GridCartesian &CoarseGrid, int hermitian_=0) 	:
     _grid(&CoarseGrid),
     _cbgrid(new GridRedBlackCartesian(&CoarseGrid)),
@@ -571,9 +584,9 @@ public:
     Stencil(&CoarseGrid,geom.npoint,Even,geom.directions,geom.displacements),
     StencilEven(_cbgrid,geom.npoint,Even,geom.directions,geom.displacements),
     StencilOdd(_cbgrid,geom.npoint,Odd,geom.directions,geom.displacements),
-    A(geom.npoint,&CoarseGrid),
-    Aeven(geom.npoint,_cbgrid),
-    Aodd(geom.npoint,_cbgrid),
+    A(MakeLinks(geom.npoint,&CoarseGrid)),
+    Aeven(MakeLinks(geom.npoint,_cbgrid)),
+    Aodd(MakeLinks(geom.npoint,_cbgrid)),
     AselfInv(&CoarseGrid),
     AselfInvEven(_cbgrid),
     AselfInvOdd(_cbgrid),
@@ -591,9 +604,9 @@ public:
     Stencil(&CoarseGrid,geom.npoint,Even,geom.directions,geom.displacements),
     StencilEven(&CoarseRBGrid,geom.npoint,Even,geom.directions,geom.displacements),
     StencilOdd(&CoarseRBGrid,geom.npoint,Odd,geom.directions,geom.displacements),
-    A(geom.npoint,&CoarseGrid),
-    Aeven(geom.npoint,&CoarseRBGrid),
-    Aodd(geom.npoint,&CoarseRBGrid),
+    A(MakeLinks(geom.npoint,&CoarseGrid)),
+    Aeven(MakeLinks(geom.npoint,&CoarseRBGrid)),
+    Aodd(MakeLinks(geom.npoint,&CoarseRBGrid)),
     AselfInv(&CoarseGrid),
     AselfInvEven(&CoarseRBGrid),
     AselfInvOdd(&CoarseRBGrid),
