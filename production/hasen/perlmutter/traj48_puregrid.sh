@@ -42,9 +42,14 @@
 #   GRID_MG_*           pass through untouched (GridMGParams::from_env rejects typos)
 #   CHECKPOINT_ROOT     default $PSCRATCH/grid_pure_hmc/ckpt; "rundir" = <rundir>/ckpt on CFS
 #   TIMEOUT_MIN         default 210 (3.5 h)
-#   DEVICE_MEM_MB       default 8000 (--device-mem)
+#   DEVICE_MEM_MB       default 8000 (--device-mem); 16000 for a pure-hmc binary from cf00b794 on
+#                       (2026-11-18, sections 2 and 9)
 #   INTEGRATOR_VERBOSE_MEM  default 0 (off); 1 = MemoryManager::Print per force call
 #   GPU_MON_MS          default 2000 (nvidia-smi sampling period); 0 = no sampler
+#   LAUNCH_PREFIX       (2026-11-10, profiling) words inserted between select_gpu and the binary,
+#                       split on spaces, e.g. grid-lqcd-workflow's common/nsys_rank.sh (Nsight
+#                       Systems on rank 0 only, its NSYS_* settings exported by the caller). Empty
+#                       (default) = the old launch line. Recorded in the ENV line only when set.
 #   SRUN_EXTRA          appended verbatim to srun (e.g. --overlap)
 #   DIAG_TOL_STRANGE, DIAG_MDSTEPS, DIAG_TRAJL  diagnostic overrides (2026-10-02, physics review
 #                       tests T1-T3): strange multishift tolerance, MD steps, trajectory length.
@@ -184,7 +189,13 @@ SEED_REQ=${HMC_SEED_OFFSET:-}
 RESUME_FROM=${RESUME_FROM:-}
 RESUME_TRAJ_REQ=${RESUME_TRAJ:-}
 TIMEOUT_MIN=${TIMEOUT_MIN:-210}
-DEVICE_MEM_MB=${DEVICE_MEM_MB:-8000}
+# Binaries built from pure-hmc cf00b794 on are the ones that contain HASEN_GRID_SHARE_OP_FIELDS;
+# they also carry the kernel-stack fix (7.9 GB per GPU freed), so their default cap is 16000
+# (section 9). Every other binary (older fork builds, the workflow's _stock_*) keeps 8000.
+PUREHMC_FORK=0
+if [ "$(grep -c -a -F HASEN_GRID_SHARE_OP_FIELDS "$BIN" || true)" -gt 0 ]; then PUREHMC_FORK=1; fi
+if [ "$PUREHMC_FORK" = 1 ]; then DEVICE_MEM_DEFAULT=16000; else DEVICE_MEM_DEFAULT=8000; fi
+DEVICE_MEM_MB=${DEVICE_MEM_MB:-$DEVICE_MEM_DEFAULT}
 GPU_MON_MS=${GPU_MON_MS:-2000}
 VERBOSE_MEM_REQ=${INTEGRATOR_VERBOSE_MEM:-0}
 CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-${PSCRATCH:+$PSCRATCH/grid_pure_hmc/ckpt}}
@@ -483,6 +494,21 @@ for v in HASEN_GRID_FUSED_CLOVER_FORCE HASEN_GRID_DEVICE_CB HASEN_GRID_BATCH_SME
     fi
   fi
 done
+# ---- pure-hmc defaults (2026-11-18): switches added on this fork's pure-hmc branch. ON when the
+# binary has the name and the caller did not set it; a binary without the name (older fork
+# builds, the workflow's _stock_*) runs as before, silently. Set VAR=0 to turn one off.
+#   HASEN_GRID_SHARE_OP_FIELDS  one copy of the links and clover off-diagonal per precision for
+#                               all operators: 16^3 bit-identical, 48^3 -5.3% force time at 16000
+#   HASEN_GRID_RELIABLE_CG      reliable-update CG for the light mixed-CG solves (driver default
+#                               Delta 0.01 = QUDA's 0.1): QUDA's iteration counts, 48^3 -4.2%
+#                               force time; agrees to solver tolerance, not bitwise
+# Measured one at a time, not yet together on a whole trajectory
+# (__docs/2026_11_06_pure_hmc_optimisation_plan.md).
+for v in HASEN_GRID_SHARE_OP_FIELDS HASEN_GRID_RELIABLE_CG; do
+  if [ -z "${!v:-}" ] && [ "$(grep -c -a -F "$v" "$BIN" || true)" -gt 0 ]; then
+    export "$v=1"
+  fi
+done
 HASEN_GRID_EXTRA=
 while read -r v; do
   [ -n "$v" ] || continue
@@ -518,7 +544,9 @@ NTASKS=16
 # 8000 -> 30.6 GB peak and ~5.8 TB host<->device per GPU per trajectory; 16000 -> 37.8 GB, MD
 # wall -8%, dH bit-exact; 20000 OOMs. Tune DEVICE_MEM_MB only for a chosen setup's final runs,
 # from its own peak at 8000 (gpu_mem_peak.txt), keeping >= 5 GB free (__docs/_SUM.md
-# hasen-tune-trajl1).
+# hasen-tune-trajl1). Binaries with the kernel-stack fix (PUREHMC_FORK=1, section 2) default to
+# 16000 (user, 2026-11-17): 48^3 base+G force time -11.9%, peak 28.7 GB, 12.2 GB free on 40 GB
+# cards (__docs/_SUM.md grid-perf-profile).
 GRID_ARGS=(--grid "$LATT" --mpi "$MPI_GEOM" --accelerator-threads 8 --shm 2048 --shm-mpi 0 --comms-overlap --device-mem "$DEVICE_MEM_MB")
 
 # ---- 10. Device-memory reporting ------------------------------------------------------
@@ -744,7 +772,9 @@ printf '%s\n' \
   'exec numactl -m $NUMA -N $NUMA "$@"' > "$SELECT_GPU"
 chmod +x "$SELECT_GPU"
 
-LAUNCH=("$SELECT_GPU" "$BIN" "${GRID_ARGS[@]}")
+LAUNCH_PREFIX=${LAUNCH_PREFIX:-}
+read -r -a LAUNCH_PREFIX_WORDS <<< "$LAUNCH_PREFIX"
+LAUNCH=("$SELECT_GPU" "${LAUNCH_PREFIX_WORDS[@]}" "$BIN" "${GRID_ARGS[@]}")
 if [ "$GPU_MON_MS" -gt 0 ]; then
   # Runs inside the main step (no second srun): nvidia-smi ignores CUDA_VISIBLE_DEVICES
   # and sees the step's four GPUs per node. Backgrounded with its own timeout as a
@@ -809,6 +839,10 @@ ENV_KV=(
   "PHYS=$PHYS"
   "HASEN_GRID_EXTRA=\"$HASEN_GRID_EXTRA\"" "GRID_MG_ENV=\"$GRID_MG_ENV\"" "GRID_FLAGS=\"${GRID_ARGS[*]}\""
 )
+if [ -n "$LAUNCH_PREFIX" ]; then
+  ENV_KV+=("LAUNCH_PREFIX=\"$LAUNCH_PREFIX\""
+           "NSYS=\"ranks=${NSYS_RANKS:-0} trace=${NSYS_TRACE:-cuda,nvtx} sample=${NSYS_SAMPLE:-none} delay=${NSYS_DELAY:-0} duration=${NSYS_DURATION:-all} out=${NSYS_OUT:-unset}\"")
+fi
 printf 'ENV TRAJ48_PUREGRID %s\n' "${ENV_KV[*]}" > "$LOG"
 {
   printf 'GRID_HASH %s\n' "${GRID_HASH_LINE:-unknown}"
