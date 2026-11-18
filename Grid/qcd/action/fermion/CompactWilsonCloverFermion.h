@@ -86,6 +86,45 @@ NAMESPACE_BEGIN(Grid);
 //           + (2 * 1 + 4 * 1/2) triangle parts = 4 triangle parts =  60 complex words per site
 //                                                                 =  84 complex words per site
 
+// Shared fields (SharedOperatorFields.h). The full-volume clover fields: import scratch, one set
+// per Impl and full grid when shared. The off-diagonal halves: one set per link set, csw and
+// anisotropy when shared (standard clover only).
+template<class Impl>
+struct CompactCloverFullStore {
+  typedef typename CompactWilsonCloverTypes<Impl>::CloverDiagonalField CloverDiagonalField;
+  typedef typename CompactWilsonCloverTypes<Impl>::CloverTriangleField CloverTriangleField;
+  CloverDiagonalField Diagonal, DiagonalInv;
+  CloverTriangleField Triangle, TriangleInv;
+  CompactCloverFullStore(GridBase *F) : Diagonal(F), DiagonalInv(F), Triangle(F), TriangleInv(F) {}
+};
+
+template<class Impl>
+struct CompactCloverTriangleStore {
+  typedef typename CompactWilsonCloverTypes<Impl>::CloverTriangleField CloverTriangleField;
+  CloverTriangleField TriangleEven, TriangleOdd;
+  SharedFieldTag tag;
+  std::shared_ptr<void> links;  // keeps the link set of the key alive
+  CompactCloverTriangleStore(GridBase *H, std::shared_ptr<void> l) : TriangleEven(H), TriangleOdd(H), links(l) {}
+};
+
+struct CompactCloverFullKey {
+  GridBase *F = nullptr;
+  bool operator==(const CompactCloverFullKey &o) const { return F == o.F; }
+};
+
+struct CompactCloverTriangleKey {
+  const void *links = nullptr;
+  GridBase *H = nullptr;
+  double csw_r = 0.0, csw_t = 0.0, cF = 0.0;
+  bool aniso = false;
+  int t_direction = 0;
+  double xi_0 = 0.0, nu = 0.0;
+  bool operator==(const CompactCloverTriangleKey &o) const {
+    return links == o.links && H == o.H && csw_r == o.csw_r && csw_t == o.csw_t && cF == o.cF &&
+           aniso == o.aniso && t_direction == o.t_direction && xi_0 == o.xi_0 && nu == o.nu;
+  }
+};
+
 template<class Impl, class CloverHelpers>
 class CompactWilsonCloverFermion : public WilsonFermion<Impl>,
                                    public WilsonCloverHelpers<Impl>,
@@ -183,6 +222,10 @@ public:
                      const CloverDiagonalField& diagonal,
                      const CloverTriangleField& triangle);
 
+  // Full-volume Mooee/MooeeInv when the full-volume fields are shared scratch: each parity
+  // through the half-checkerboard fields (site-local, the same numbers).
+  void MooeeFullByParity(const FermionField& in, FermionField& out, bool inverse);
+
   /////////////////////////////////////////////
   // Helpers
   /////////////////////////////////////////////
@@ -227,11 +270,40 @@ public:
 
   bool fixedBoundaries;
 
-  CloverDiagonalField Diagonal,    DiagonalEven,    DiagonalOdd;
-  CloverDiagonalField DiagonalInv, DiagonalInvEven, DiagonalInvOdd;
+  // The full-volume fields live in _full and the off-diagonal halves in _tri: this operator's
+  // own, or shared with HASEN_GRID_SHARE_OP_FIELDS=1 (SharedOperatorFields.h). The flags must
+  // stay declared before the stores, and the stores before the references.
+  bool _fullShared = false;
+  bool _triShared = false;
+  std::shared_ptr<CompactCloverFullStore<Impl>> _full;
+  std::shared_ptr<CompactCloverTriangleStore<Impl>> _tri;
+  uint64_t _triSeen = 0;
 
-  CloverTriangleField Triangle,    TriangleEven,    TriangleOdd;
-  CloverTriangleField TriangleInv, TriangleInvEven, TriangleInvOdd;
+  CloverDiagonalField &Diagonal;    CloverDiagonalField DiagonalEven,    DiagonalOdd;
+  CloverDiagonalField &DiagonalInv; CloverDiagonalField DiagonalInvEven, DiagonalInvOdd;
+
+  CloverTriangleField &Triangle;    CloverTriangleField &TriangleEven,   &TriangleOdd;
+  CloverTriangleField &TriangleInv; CloverTriangleField TriangleInvEven, TriangleInvOdd;
+
+  bool FullShared(void) const { return _fullShared; }
+  bool TriangleShared(void) const { return _triShared; }
+  SharedFieldTag &TriangleTag(void) { return _tri->tag; }
+  void MarkTriangleWritten(int64_t epoch) {
+    _tri->tag.version = NextSharedFieldVersion();
+    _tri->tag.epoch = epoch;
+    _triSeen = _tri->tag.version;
+  }
+  void MarkTriangleSeen(void) { _triSeen = _tri->tag.version; }
+  // False iff another operator has written the shared links or off-diagonal halves since this
+  // one's import (hides WilsonFermion's, which checks the links only).
+  bool SharedFieldsCurrent(void) const {
+    return WilsonBase::SharedFieldsCurrent() && _triSeen == _tri->tag.version;
+  }
+
+  static std::shared_ptr<CompactCloverFullStore<Impl>> MakeFullStore(GridBase *F, bool &shared);
+  std::shared_ptr<CompactCloverTriangleStore<Impl>> MakeTriangleStore(GridBase *H, RealD csw_r, RealD csw_t, RealD cF,
+                                                                     const WilsonAnisotropyCoefficients &anis,
+                                                                     bool fixedBC, bool &shared);
 
   FermionField Tmp;
 

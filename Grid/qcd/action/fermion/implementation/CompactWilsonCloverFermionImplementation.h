@@ -49,10 +49,13 @@ CompactWilsonCloverFermion<Impl, CloverHelpers>::CompactWilsonCloverFermion(Gaug
   , csw_t(_csw_t)
   , cF(_cF)
   , fixedBoundaries(impl_p.boundary_phases[Nd-1] == 0.0)
-  , Diagonal(&Fgrid),        Triangle(&Fgrid)
-  , DiagonalEven(&Hgrid),    TriangleEven(&Hgrid)
-  , DiagonalOdd(&Hgrid),     TriangleOdd(&Hgrid)
-  , DiagonalInv(&Fgrid),     TriangleInv(&Fgrid)
+  , _full(MakeFullStore(&Fgrid, _fullShared))
+  , _tri(MakeTriangleStore(&Hgrid, _csw_r, _csw_t, _cF, clover_anisotropy,
+                           impl_p.boundary_phases[Nd-1] == 0.0, _triShared))
+  , Diagonal(_full->Diagonal),       Triangle(_full->Triangle)
+  , DiagonalEven(&Hgrid),            TriangleEven(_tri->TriangleEven)
+  , DiagonalOdd(&Hgrid),             TriangleOdd(_tri->TriangleOdd)
+  , DiagonalInv(_full->DiagonalInv), TriangleInv(_full->TriangleInv)
   , DiagonalInvEven(&Hgrid), TriangleInvEven(&Hgrid)
   , DiagonalInvOdd(&Hgrid),  TriangleInvOdd(&Hgrid)
   , Tmp(&Fgrid)
@@ -144,6 +147,8 @@ void CompactWilsonCloverFermion<Impl, CloverHelpers>::Mooee(const FermionField& 
     } else {
       MooeeInternal(in, out, DiagonalEven, TriangleEven);
     }
+  } else if(_fullShared) {
+    MooeeFullByParity(in, out, false);
   } else {
     MooeeInternal(in, out, Diagonal, Triangle);
   }
@@ -163,6 +168,8 @@ void CompactWilsonCloverFermion<Impl, CloverHelpers>::MooeeInv(const FermionFiel
     } else {
       MooeeInternal(in, out, DiagonalInvEven, TriangleInvEven);
     }
+  } else if(_fullShared) {
+    MooeeFullByParity(in, out, true);
   } else {
     MooeeInternal(in, out, DiagonalInv, TriangleInv);
   }
@@ -389,6 +396,72 @@ void CompactWilsonCloverFermion<Impl, CloverHelpers>::MooeeInternal(const Fermio
 }
 
 template<class Impl, class CloverHelpers>
+void CompactWilsonCloverFermion<Impl, CloverHelpers>::MooeeFullByParity(const FermionField& in,
+                                                                         FermionField& out, bool inverse) {
+  GridBase* hgrid = this->FermionRedBlackGrid();
+  FermionField in_e(hgrid), in_o(hgrid), out_e(hgrid), out_o(hgrid);
+  pickCheckerboard(Even, in_e, in);
+  pickCheckerboard(Odd,  in_o, in);
+  if(inverse) {
+    MooeeInternal(in_e, out_e, DiagonalInvEven, TriangleInvEven);
+    MooeeInternal(in_o, out_o, DiagonalInvOdd,  TriangleInvOdd);
+  } else {
+    MooeeInternal(in_e, out_e, DiagonalEven, TriangleEven);
+    MooeeInternal(in_o, out_o, DiagonalOdd,  TriangleOdd);
+  }
+  setCheckerboard(out, out_e);
+  setCheckerboard(out, out_o);
+  out.Checkerboard() = in.Checkerboard();
+}
+
+// The full-volume set: own, or (HASEN_GRID_SHARE_OP_FIELDS=1, Impl D or F) one import scratch set
+// per Impl and full grid (SharedOperatorFields.h).
+template<class Impl, class CloverHelpers>
+std::shared_ptr<CompactCloverFullStore<Impl>>
+CompactWilsonCloverFermion<Impl, CloverHelpers>::MakeFullStore(GridBase* F, bool& shared) {
+  shared = false;
+  if constexpr (ShareableWilsonImpl<Impl>::value) {
+    if(ShareOpFieldsEnabled()) {
+      CompactCloverFullKey k;
+      k.F = F;
+      shared = true;
+      return SharedFieldPool<CompactCloverFullStore<Impl>, CompactCloverFullKey>::Get(
+          k, [F] { return new CompactCloverFullStore<Impl>(F); });
+    }
+  }
+  return std::make_shared<CompactCloverFullStore<Impl>>(F);
+}
+
+// The off-diagonal halves: own, or shared by operators with the same (shared) link set, csw, cF
+// and anisotropy. Standard clover with periodic/antiperiodic time only: the mass must stay out of
+// the off-diagonal (SharedOperatorFields.h).
+template<class Impl, class CloverHelpers>
+std::shared_ptr<CompactCloverTriangleStore<Impl>>
+CompactWilsonCloverFermion<Impl, CloverHelpers>::MakeTriangleStore(GridBase* H, RealD k_csw_r, RealD k_csw_t,
+                                                                    RealD k_cF,
+                                                                    const WilsonAnisotropyCoefficients& anis,
+                                                                    bool fixedBC, bool& shared) {
+  shared = false;
+  if(std::is_same<CloverHelpers, CompactCloverHelpers<Impl>>::value && this->LinksShared() && !fixedBC) {
+    CompactCloverTriangleKey k;
+    k.links = static_cast<const void*>(this->_links.get());
+    k.H = H;
+    k.csw_r = k_csw_r;
+    k.csw_t = k_csw_t;
+    k.cF = k_cF;
+    k.aniso = anis.isAnisotropic;
+    k.t_direction = anis.t_direction;
+    k.xi_0 = anis.xi_0;
+    k.nu = anis.nu;
+    std::shared_ptr<void> keep = this->_links;
+    shared = true;
+    return SharedFieldPool<CompactCloverTriangleStore<Impl>, CompactCloverTriangleKey>::Get(
+        k, [H, keep] { return new CompactCloverTriangleStore<Impl>(H, keep); });
+  }
+  return std::make_shared<CompactCloverTriangleStore<Impl>>(H, nullptr);
+}
+
+template<class Impl, class CloverHelpers>
 void CompactWilsonCloverFermion<Impl, CloverHelpers>::ImportGauge(const GaugeField& _Umu) {
   // NOTE: parts copied from original implementation
 
@@ -454,6 +527,7 @@ void CompactWilsonCloverFermion<Impl, CloverHelpers>::ImportGauge(const GaugeFie
   pickCheckerboard(Even, TriangleInvEven, TriangleInv);
   pickCheckerboard(Odd,  DiagonalInvOdd,  DiagonalInv);
   pickCheckerboard(Odd,  TriangleInvOdd,  TriangleInv);
+  MarkTriangleWritten(-1);  // shared halves: other operators must re-import (SharedOperatorFields.h)
 
   // Report timings
   double t9 = usecond();

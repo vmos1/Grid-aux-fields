@@ -15,6 +15,11 @@
 // allocated at the same address inherits the old shadow. Both are absent in the production
 // driver as audited (operators live for the whole run; see report).
 //
+// Shared operator fields (HASEN_GRID_SHARE_OP_FIELDS=1, Grid/qcd/action/fermion/
+// SharedOperatorFields.h): an operator whose shared links or clover off-diagonal another operator
+// has written since its own import is imported again even if its shadow matches U (the other
+// operator may have written a different field, e.g. at the force-gradient shifted point).
+//
 // HASEN_GRID_IMPORT_SKIP_VERBOSE=1: one line per guarded call on the boss rank with cumulative
 // skipped/performed counts for that operator.
 //
@@ -67,7 +72,10 @@ void GuardedImportGauge(Op &op, const GF &U) {
   }
   auto &e = ImportGuardRegistry<GF>().reg[static_cast<const void *>(&op)];
   bool same = false;
-  if (e.last && e.last->Grid() == U.Grid()) {
+  // Shared operator fields (HASEN_GRID_SHARE_OP_FIELDS=1): if another operator has written them
+  // since this one's import, this one must import again whatever its shadow says.
+  const bool current = SharedFieldsCurrentFor(op);
+  if (current && e.last && e.last->Grid() == U.Grid()) {
     // Exact device-side test, one link direction at a time (temp = 1/4 of a GaugeField).
     same = true;
     for (int mu = 0; mu < Nd && same; ++mu) {
@@ -86,7 +94,7 @@ void GuardedImportGauge(Op &op, const GF &U) {
   }
   if (ImportSkipVerbose() && U.Grid()->IsBoss()) {
     std::cout << GridLogMessage << "ImportGuard op=" << static_cast<const void *>(&op)
-              << (same ? " SKIP" : " IMPORT") << " cum_skipped=" << e.skipped
+              << (same ? " SKIP" : (current ? " IMPORT" : " IMPORT shared-stale")) << " cum_skipped=" << e.skipped
               << " cum_performed=" << e.performed << std::endl;
   }
 }

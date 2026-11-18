@@ -39,6 +39,36 @@ NAMESPACE_BEGIN(Grid);
 // Constructor and gauge import
 /////////////////////////////////
 
+// The doubled-link set: this operator's own, or (HASEN_GRID_SHARE_OP_FIELDS=1, Impl D or F) the
+// one shared by every live operator with the same grids, boundary phases, twists, Dirichlet setup
+// and anisotropy (SharedOperatorFields.h).
+template <class Impl>
+std::shared_ptr<WilsonLinkStore<Impl>>
+WilsonFermion<Impl>::MakeLinkStore(GridBase *F, GridBase *H, const ImplParams &p,
+                                   const WilsonAnisotropyCoefficients &anis, bool &shared)
+{
+  shared = false;
+  if constexpr (ShareableWilsonImpl<Impl>::value) {
+    if (ShareOpFieldsEnabled()) {
+      WilsonLinkKey k;
+      k.F = F;
+      k.H = H;
+      for (int mu = 0; mu < (int)p.boundary_phases.size(); mu++) k.phases.push_back(p.boundary_phases[mu]);
+      for (int mu = 0; mu < (int)p.twist_n_2pi_L.size(); mu++) k.twist.push_back(p.twist_n_2pi_L[mu]);
+      for (int mu = 0; mu < (int)p.dirichlet.size(); mu++) k.dirichlet.push_back(p.dirichlet[mu]);
+      k.partialDirichlet = p.partialDirichlet;
+      k.aniso = anis.isAnisotropic;
+      k.t_direction = anis.t_direction;
+      k.xi_0 = anis.xi_0;
+      k.nu = anis.nu;
+      shared = true;
+      return SharedFieldPool<WilsonLinkStore<Impl>, WilsonLinkKey>::Get(
+          k, [F, H] { return new WilsonLinkStore<Impl>(F, H); });
+    }
+  }
+  return std::make_shared<WilsonLinkStore<Impl>>(F, H);
+}
+
 template <class Impl>
 WilsonFermion<Impl>::WilsonFermion(GaugeField &_Umu, GridCartesian &Fgrid,
                                    GridRedBlackCartesian &Hgrid, RealD _mass,
@@ -52,9 +82,10 @@ WilsonFermion<Impl>::WilsonFermion(GaugeField &_Umu, GridCartesian &Fgrid,
     StencilEven(&Hgrid, npoint, Even, directions,displacements,p),  // source is Even
     StencilOdd(&Hgrid, npoint, Odd, directions,displacements,p),  // source is Odd
     mass(_mass),
-    Umu(&Fgrid),
-    UmuEven(&Hgrid),
-    UmuOdd(&Hgrid),
+    _links(MakeLinkStore(&Fgrid, &Hgrid, p, anis, _linksShared)),
+    Umu(_links->Umu),
+    UmuEven(_links->UmuEven),
+    UmuOdd(_links->UmuOdd),
       _tmp(&Hgrid),
       anisotropyCoeff(anis)
 {
@@ -99,6 +130,7 @@ void WilsonFermion<Impl>::ImportGauge(const GaugeField &_Umu)
   Impl::DoubleStore(GaugeGrid(), Umu, HUmu);
   pickCheckerboard(Even, UmuEven, Umu);
   pickCheckerboard(Odd, UmuOdd, Umu);
+  MarkLinksWritten(-1);  // shared links: other operators must re-import (SharedOperatorFields.h)
 }
 
 /////////////////////////////

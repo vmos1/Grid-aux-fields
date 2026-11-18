@@ -26,6 +26,12 @@
 //     The eight checkerboard picks then also run on the device (acceleratorPickCheckerboard, an
 //     exact copy) so that the import never moves the clover fields through the host.
 //
+// With HASEN_GRID_SHARE_OP_FIELDS=1 as well (Grid/qcd/action/fermion/SharedOperatorFields.h),
+// operators of one precision share the doubled links and the clover off-diagonal halves. The
+// field-strength cache's epoch names U; an import whose shared links / halves already carry that
+// epoch skips rewriting them (the field strength is then looked up first). Exact: the skipped
+// fields hold the same numbers. Without the field-strength cache every import rewrites them.
+//
 // Dispatch: GuardedImportGauge (import_guard.h) calls ImportGaugeDispatch, which takes this path
 // when either gate is on (composing with HASEN_GRID_IMPORT_SKIP, which decides first whether an
 // import happens at all) and otherwise calls the stock op.ImportGauge(U), untouched.
@@ -73,6 +79,17 @@ inline bool ImportTimersEnabled() {
 }
 inline bool FastImportEnabled() { return ShareFieldStrengthEnabled() || GpuCloverInvEnabled(); }
 
+// True unless the operator shares fields (SharedOperatorFields.h) that another operator has
+// written since this one's import. Operators without SharedFieldsCurrent() are always current.
+template <class Op>
+inline auto SharedFieldsCurrentImpl(const Op &op, int) -> decltype(op.SharedFieldsCurrent()) {
+  return op.SharedFieldsCurrent();
+}
+template <class Op>
+inline bool SharedFieldsCurrentImpl(const Op &, long) { return true; }
+template <class Op>
+inline bool SharedFieldsCurrentFor(const Op &op) { return SharedFieldsCurrentImpl(op, 0); }
+
 // ---- the operator types the fast path supports: the driver's WCF and WCF_f ----
 template <class Op> struct FastImportSupported : std::false_type {};
 template <>
@@ -101,6 +118,9 @@ struct FieldStrengthCache {
   std::unique_ptr<GaugeLinkField> F[6];    // Bx By Bz Ex Ey Ez
   long hits = 0;
   long misses = 0;
+  // Names the field in the shadow: new on every miss. Shared operator fields
+  // (SharedOperatorFields.h) record it, so a second operator imported at the same U can skip them.
+  int64_t epoch = 0;
 };
 template <class Impl>
 inline FieldStrengthCache<Impl> &FieldStrengthCacheFor() {
@@ -109,9 +129,10 @@ inline FieldStrengthCache<Impl> &FieldStrengthCacheFor() {
 }
 
 // Fill F[] with the field strength of U from the cache (computing it on a miss). hit = reused.
+// epoch (if given) = the cache's epoch after the call, naming U.
 template <class Impl>
 inline void SharedFieldStrength(const typename Impl::GaugeField &U, const typename Impl::GaugeLinkField *F[6],
-                                bool &hit) {
+                                bool &hit, int64_t *epoch = nullptr) {
   typedef typename Impl::GaugeField GaugeField;
   typedef typename Impl::GaugeLinkField GaugeLinkField;
   auto &c = FieldStrengthCacheFor<Impl>();
@@ -137,8 +158,10 @@ inline void SharedFieldStrength(const typename Impl::GaugeField &U, const typena
     FastImportFieldStrength<Impl>(Fw, U);
     *c.shadow = U;
     ++c.misses;
+    ++c.epoch;
   }
   for (int i = 0; i < 6; ++i) F[i] = c.F[i].get();
+  if (epoch) *epoch = c.epoch;
 }
 
 // ---- GPU inversion of the compact clover term ----
@@ -281,31 +304,59 @@ void FastImportGaugeCompact(CompactWilsonCloverFermion<Impl, CompactCloverHelper
   GRID_ASSERT(!op.fixedBoundaries);
 
   double t0 = usecond();
-  // Doubled-link store: the base-class import by qualified name (no virtual dispatch).
-  WilsonFermion<Impl> &base = op;
-  base.WilsonFermion<Impl>::ImportGauge(U);
-  if (timers) accelerator_barrier();
-  double t1 = usecond();
-
   conformable(U.Grid(), op.GaugeGrid());
   GridBase *grid = U.Grid();
+  WilsonFermion<Impl> &base = op;
 
-  // Field strength: shared (cache) or per import (stock).
+  // Shared operator fields (HASEN_GRID_SHARE_OP_FIELDS=1, SharedOperatorFields.h) are keyed by the
+  // field-strength cache's epoch, so they need the cache (share). The field strength then comes
+  // first, to know the epoch before the links; otherwise the stock order, links first.
+  const bool opshare = share && op.LinksShared();
   bool hit = false;
+  int64_t epoch = -1;
+  bool links_reused = false;
+  double wilson_s = 0.0, fieldstrength_s = 0.0;
   std::unique_ptr<GaugeLinkField> own[6];
   const GaugeLinkField *F[6];
-  if (share) {
-    SharedFieldStrength<Impl>(U, F, hit);
-  } else {
-    GaugeLinkField *Fw[6];
-    for (int i = 0; i < 6; ++i) {
-      own[i].reset(new GaugeLinkField(grid));
-      Fw[i] = own[i].get();
+
+  // Doubled-link store: the base-class import by qualified name (no virtual dispatch), skipped
+  // when the shared links already hold this U.
+  auto import_links = [&]() {
+    const double a = usecond();
+    if (opshare && op.LinksTag().epoch == epoch) {
+      op.MarkLinksSeen();
+      links_reused = true;
+    } else {
+      base.WilsonFermion<Impl>::ImportGauge(U);
+      if (opshare) op.LinksTag().epoch = epoch;
     }
-    FastImportFieldStrength<Impl>(Fw, U);
-    for (int i = 0; i < 6; ++i) F[i] = own[i].get();
+    if (timers) accelerator_barrier();
+    wilson_s = (usecond() - a) / 1.0e6;
+  };
+  // Field strength: shared (cache) or per import (stock).
+  auto field_strength = [&]() {
+    const double a = usecond();
+    if (share) {
+      SharedFieldStrength<Impl>(U, F, hit, &epoch);
+    } else {
+      GaugeLinkField *Fw[6];
+      for (int i = 0; i < 6; ++i) {
+        own[i].reset(new GaugeLinkField(grid));
+        Fw[i] = own[i].get();
+      }
+      FastImportFieldStrength<Impl>(Fw, U);
+      for (int i = 0; i < 6; ++i) F[i] = own[i].get();
+    }
+    if (timers) accelerator_barrier();
+    fieldstrength_s = (usecond() - a) / 1.0e6;
+  };
+  if (opshare) {
+    field_strength();
+    import_links();
+  } else {
+    import_links();
+    field_strength();
   }
-  if (timers) accelerator_barrier();
   double t2 = usecond();
 
   // Clover term, exactly the stock expressions (csw_r, csw_t already carry the 0.5).
@@ -334,6 +385,9 @@ void FastImportGaugeCompact(CompactWilsonCloverFermion<Impl, CompactCloverHelper
   if (timers) accelerator_barrier();
   double t5 = usecond();
 
+  // Shared off-diagonal halves: skipped when they already hold this U's (mass-independent).
+  const bool trishare = opshare && op.TriangleShared();
+  const bool tri_reused = trishare && op.TriangleTag().epoch == epoch;
   if (gpuinv) {
     // Device-resident import: the eight checkerboard copies on the device as well. The stock
     // pickCheckerboard is a host thread_for (CpuWrite/CpuRead views, Lattice_transfer.h); after the
@@ -341,22 +395,27 @@ void FastImportGaugeCompact(CompactWilsonCloverFermion<Impl, CompactCloverHelper
     // host->device copy of the eight half fields at their next device use.
     // acceleratorPickCheckerboard (same header) is the same element copy on the device: exact.
     acceleratorPickCheckerboard(Even, op.DiagonalEven,    op.Diagonal);
-    acceleratorPickCheckerboard(Even, op.TriangleEven,    op.Triangle);
+    if (!tri_reused) acceleratorPickCheckerboard(Even, op.TriangleEven,    op.Triangle);
     acceleratorPickCheckerboard(Odd,  op.DiagonalOdd,     op.Diagonal);
-    acceleratorPickCheckerboard(Odd,  op.TriangleOdd,     op.Triangle);
+    if (!tri_reused) acceleratorPickCheckerboard(Odd,  op.TriangleOdd,     op.Triangle);
     acceleratorPickCheckerboard(Even, op.DiagonalInvEven, op.DiagonalInv);
     acceleratorPickCheckerboard(Even, op.TriangleInvEven, op.TriangleInv);
     acceleratorPickCheckerboard(Odd,  op.DiagonalInvOdd,  op.DiagonalInv);
     acceleratorPickCheckerboard(Odd,  op.TriangleInvOdd,  op.TriangleInv);
   } else {
     pickCheckerboard(Even, op.DiagonalEven,    op.Diagonal);
-    pickCheckerboard(Even, op.TriangleEven,    op.Triangle);
+    if (!tri_reused) pickCheckerboard(Even, op.TriangleEven,    op.Triangle);
     pickCheckerboard(Odd,  op.DiagonalOdd,     op.Diagonal);
-    pickCheckerboard(Odd,  op.TriangleOdd,     op.Triangle);
+    if (!tri_reused) pickCheckerboard(Odd,  op.TriangleOdd,     op.Triangle);
     pickCheckerboard(Even, op.DiagonalInvEven, op.DiagonalInv);
     pickCheckerboard(Even, op.TriangleInvEven, op.TriangleInv);
     pickCheckerboard(Odd,  op.DiagonalInvOdd,  op.DiagonalInv);
     pickCheckerboard(Odd,  op.TriangleInvOdd,  op.TriangleInv);
+  }
+  if (tri_reused) {
+    op.MarkTriangleSeen();
+  } else {
+    op.MarkTriangleWritten(trishare ? epoch : -1);
   }
   if (timers) {
     accelerator_barrier();
@@ -371,10 +430,11 @@ void FastImportGaugeCompact(CompactWilsonCloverFermion<Impl, CompactCloverHelper
       std::ostringstream s;
       s << std::fixed << std::setprecision(6) << "ImportTimer fast prec=" << (dp ? "D" : "F")
         << " fs=" << (share ? (hit ? "hit" : "miss") : "own") << " inv=" << (gpuinv ? "gpu" : "host")
-        << " wilson_s=" << (t1 - t0) / 1e6 << " fieldstrength_s=" << (t2 - t1) / 1e6
+        << " wilson_s=" << wilson_s << " fieldstrength_s=" << fieldstrength_s
         << " fill_s=" << (t3 - t2) / 1e6 << " inst_convert_s=" << (t4 - t3) / 1e6
         << " invert_s=" << (t5 - t4) / 1e6 << " pick_s=" << (t6 - t5) / 1e6
         << " total_s=" << (t6 - t0) / 1e6 << " n=" << n << " cum_total_s=" << cum;
+      if (opshare) s << " links=" << (links_reused ? "reused" : "import") << " tri=" << (tri_reused ? "reused" : "pick");
       std::cout << GridLogMessage << s.str() << std::endl;
     }
   }

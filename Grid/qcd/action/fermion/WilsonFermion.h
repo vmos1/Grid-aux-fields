@@ -30,6 +30,8 @@ directory
 			   /*  END LEGAL */
 #pragma once
 
+#include <Grid/qcd/action/fermion/SharedOperatorFields.h>
+
 NAMESPACE_BEGIN(Grid);
 
 class WilsonFermionStatic {
@@ -54,6 +56,38 @@ public:
     t_direction(Nd-1),
     xi_0(1.0),
     nu(1.0){}
+};
+
+// Shared doubled links (SharedOperatorFields.h): which Impls may share, the set, and its key.
+template <class Impl> struct ShareableWilsonImpl : std::false_type {};
+template <> struct ShareableWilsonImpl<WilsonImplD> : std::true_type {};
+template <> struct ShareableWilsonImpl<WilsonImplF> : std::true_type {};
+
+template <class Impl>
+struct WilsonLinkStore {
+  typedef typename Impl::DoubledGaugeField DoubledGaugeField;
+  DoubledGaugeField Umu;
+  DoubledGaugeField UmuEven;
+  DoubledGaugeField UmuOdd;
+  SharedFieldTag tag;
+  WilsonLinkStore(GridBase *F, GridBase *H) : Umu(F), UmuEven(H), UmuOdd(H) {}
+};
+
+struct WilsonLinkKey {
+  GridBase *F = nullptr;
+  GridBase *H = nullptr;
+  std::vector<ComplexD> phases;
+  std::vector<RealD> twist;
+  std::vector<int> dirichlet;
+  int partialDirichlet = 0;
+  bool aniso = false;
+  int t_direction = 0;
+  double xi_0 = 0.0, nu = 0.0;
+  bool operator==(const WilsonLinkKey &o) const {
+    return F == o.F && H == o.H && phases == o.phases && twist == o.twist && dirichlet == o.dirichlet &&
+           partialDirichlet == o.partialDirichlet && aniso == o.aniso && t_direction == o.t_direction &&
+           xi_0 == o.xi_0 && nu == o.nu;
+  }
 };
 
 template <class Impl>
@@ -172,10 +206,32 @@ public:
     StencilOdd.SetSloppyComms(sloppy);
   }
 
-  // Copy of the gauge field , with even and odd subsets
-  DoubledGaugeField Umu;
-  DoubledGaugeField UmuEven;
-  DoubledGaugeField UmuOdd;
+  // Copy of the gauge field , with even and odd subsets. They live in _links, owned by this
+  // operator or, with HASEN_GRID_SHARE_OP_FIELDS=1, shared (SharedOperatorFields.h). _links
+  // must stay declared before the three references, and _linksShared before _links (the _links
+  // initializer sets it).
+  bool _linksShared = false;
+  std::shared_ptr<WilsonLinkStore<Impl>> _links;
+  uint64_t _linksSeen = 0;
+  DoubledGaugeField &Umu;
+  DoubledGaugeField &UmuEven;
+  DoubledGaugeField &UmuOdd;
+
+  bool LinksShared(void) const { return _linksShared; }
+  SharedFieldTag &LinksTag(void) { return _links->tag; }
+  // A write to the links: new version, recorded by this operator; epoch -1 = unknown field.
+  void MarkLinksWritten(int64_t epoch) {
+    _links->tag.version = NextSharedFieldVersion();
+    _links->tag.epoch = epoch;
+    _linksSeen = _links->tag.version;
+  }
+  // This operator's import found the links already holding its field: record the version.
+  void MarkLinksSeen(void) { _linksSeen = _links->tag.version; }
+  // False iff another operator has written the shared links since this one's import.
+  bool SharedFieldsCurrent(void) const { return _linksSeen == _links->tag.version; }
+  static std::shared_ptr<WilsonLinkStore<Impl>> MakeLinkStore(GridBase *F, GridBase *H, const ImplParams &p,
+                                                               const WilsonAnisotropyCoefficients &anis,
+                                                               bool &shared);
 
   WilsonAnisotropyCoefficients anisotropyCoeff;
 
