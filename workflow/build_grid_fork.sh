@@ -61,7 +61,8 @@ provenance_line() {
 }
 
 prepare() {
-  [[ -d "${TREE}/.git" ]] || { printf 'ERROR: %s is not a git tree\n' "${TREE}" >&2; exit 1; }
+  # -e, not -d: in a git worktree .git is a file pointing at the main clone's git dir.
+  [[ -e "${TREE}/.git" ]] || { printf 'ERROR: %s is not a git tree\n' "${TREE}" >&2; exit 1; }
   if [[ -f "${PREPARED_MARKER}" ]]; then
     printf 'Already prepared (%s). Re-running filelist + autoreconf only.\n' "$(<"${PREPARED_MARKER}")"
   else
