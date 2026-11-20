@@ -128,8 +128,19 @@ void WilsonFermion<Impl>::ImportGauge(const GaugeField &_Umu)
     HUmu = _Umu * (-0.5);
   }
   Impl::DoubleStore(GaugeGrid(), Umu, HUmu);
-  pickCheckerboard(Even, UmuEven, Umu);
-  pickCheckerboard(Odd, UmuOdd, Umu);
+  // Checkerboard split of the doubled links. The host pickCheckerboard is a thread_for that
+  // opens host views: the full doubled field (764 MB fp64 at 48^3 on 16 GPUs) goes to the host
+  // and both halves come back on first device use. The accelerator variant is the same element
+  // copy on the device: exact. Runtime gate HASEN_GRID_DEVICE_CB=1 (default off), as
+  // SchurDifferentiableOperator::AssembleForce.
+  static const bool device_cb = [](){ const char *e = getenv("HASEN_GRID_DEVICE_CB"); return e && e[0]=='1'; }();
+  if (device_cb) {
+    acceleratorPickCheckerboard(Even, UmuEven, Umu, UmuEven.Grid()->_checker_dim);
+    acceleratorPickCheckerboard(Odd, UmuOdd, Umu, UmuOdd.Grid()->_checker_dim);
+  } else {
+    pickCheckerboard(Even, UmuEven, Umu);
+    pickCheckerboard(Odd, UmuOdd, Umu);
+  }
   MarkLinksWritten(-1);  // shared links: other operators must re-import (SharedOperatorFields.h)
 }
 
