@@ -51,6 +51,10 @@
 #                       Systems on rank 0 only, its NSYS_* settings exported by the caller). Empty
 #                       (default) = the old launch line. Recorded in the ENV line only when set.
 #   SRUN_EXTRA          appended verbatim to srun (e.g. --overlap)
+#   GRID_EXTRA_ARGS     (2026-11-20) Grid flags appended to GRID_ARGS, word-split, e.g.
+#                       "--log Error,Warning,Message,Performance" for GridLogPerformance lines.
+#                       Unset (default) = none. Logging flags change what is printed, not the
+#                       arithmetic. Recorded in the ENV line (GRID_FLAGS), not in PHYS.
 #   DIAG_TOL_STRANGE, DIAG_MDSTEPS, DIAG_TRAJL  diagnostic overrides (2026-10-02, physics review
 #                       tests T1-T3): strange multishift tolerance, MD steps, trajectory length.
 #                       Unset = production. The ENV line records the values actually used.
@@ -548,6 +552,8 @@ NTASKS=16
 # 16000 (user, 2026-11-17): 48^3 base+G force time -11.9%, peak 28.7 GB, 12.2 GB free on 40 GB
 # cards (__docs/_SUM.md grid-perf-profile).
 GRID_ARGS=(--grid "$LATT" --mpi "$MPI_GEOM" --accelerator-threads 8 --shm 2048 --shm-mpi 0 --comms-overlap --device-mem "$DEVICE_MEM_MB")
+read -r -a GRID_EXTRA_WORDS <<< "${GRID_EXTRA_ARGS:-}"
+GRID_ARGS+=("${GRID_EXTRA_WORDS[@]}")
 
 # ---- 10. Device-memory reporting ------------------------------------------------------
 # INTEGRATOR_VERBOSE_MEM=1 re-enables patch 03's MemoryManager::Print around every force
