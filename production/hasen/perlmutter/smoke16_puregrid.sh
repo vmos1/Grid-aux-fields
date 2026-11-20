@@ -274,6 +274,11 @@ NTASKS=4
 # run is CG only, the C2 probe ran with Grid's default, and the cache size does
 # not change arithmetic. Add it at M2 when MG enters.
 GRID_ARGS=(--grid "$LATT" --mpi "$MPI_GEOM" --accelerator-threads 8 --shm 2048 --shm-mpi 0 --comms-overlap)
+# GRID_EXTRA_ARGS (optional, unset = none, the recipe above unchanged): Grid flags appended as
+# given, word-split, e.g. "--log Error,Warning,Message,Performance" to see GridLogPerformance
+# lines. Logging flags change what is printed, not the arithmetic. Recorded in the ENV line.
+read -r -a GRID_EXTRA_WORDS <<< "${GRID_EXTRA_ARGS:-}"
+GRID_ARGS+=("${GRID_EXTRA_WORDS[@]}")
 
 # ---- 8. Run directory (refuse to overwrite) -----------------------------------
 DATE_TAG=$(date +%Y_%-m_%-d)                              # unpadded, runs/ convention
