@@ -93,7 +93,8 @@ for h in $(cd "$HB/include" && find Grid -name '*.h'); do
 done
 
 # Patch 04 must be in the tree (see header).
-GCM=$GRID_SOURCE/Grid/algorithms/multigrid/GeneralCoarsenedMatrix.h
+# Upstream develop 3232b438 keeps this header under multigrid/deprecated/.
+GCM=$GRID_SOURCE/Grid/algorithms/multigrid/deprecated/GeneralCoarsenedMatrix.h
 N04=$(grep -c 'Honour the checkerboard of the subspace' "$GCM" || true)
 if [ "$N04" -lt 2 ]; then
   echo "ERROR: $GCM does not carry patch 04 (found $N04 of 2 hunks)." >&2
@@ -119,8 +120,8 @@ CXXFLAGS="-I$HB/include -I$HB/src -I$GRID_SOURCE -I$GRID_BUILD/Grid $("$GRID_CON
 for PFX in $("$GRID_CONFIG" --cxxflags); do
   case "$PFX" in
     -I*) d=${PFX#-I}
-         if [ -f "$d/Grid/algorithms/multigrid/GeneralCoarsenedMatrix.h" ] && \
-            ! cmp -s "$d/Grid/algorithms/multigrid/GeneralCoarsenedMatrix.h" "$GCM"; then
+         if [ -f "$d/Grid/algorithms/multigrid/deprecated/GeneralCoarsenedMatrix.h" ] && \
+            ! cmp -s "$d/Grid/algorithms/multigrid/deprecated/GeneralCoarsenedMatrix.h" "$GCM"; then
            echo "NOTE: $d/Grid carries a GeneralCoarsenedMatrix.h WITHOUT patch 04; it is shadowed by -I$GRID_SOURCE (placed first)."
          fi ;;
   esac
@@ -144,7 +145,7 @@ DEPS=$BIN.d
 # GeneralCoarsenedMatrix.h was compiled: it must be the patched source-tree copy.
 check_gcm_used() {
   local used
-  used=$(tr ' \\' '\n\n' < "$DEPS" | grep 'multigrid/GeneralCoarsenedMatrix.h$' | head -1)
+  used=$(tr ' \\' '\n\n' < "$DEPS" | grep 'multigrid/deprecated/GeneralCoarsenedMatrix.h$' | head -1)
   if [ -z "$used" ] || [ "$(readlink -f "$used")" != "$(readlink -f "$GCM")" ]; then
     echo "ERROR: compiled GeneralCoarsenedMatrix.h = '${used:-none}', expected $GCM (patch 04)." >&2
     exit 1

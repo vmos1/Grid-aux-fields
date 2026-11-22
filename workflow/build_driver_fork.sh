@@ -24,7 +24,8 @@ HB=$TREE/production/hasen
 [ -f "$HB/params.h" ] || { echo "ERROR: $HB/params.h missing." >&2; exit 1; }
 
 # Patch 04 must be in the tree (the Grid-MG route coarsens on the Odd checkerboard).
-GCM=$TREE/Grid/algorithms/multigrid/GeneralCoarsenedMatrix.h
+# Upstream develop 3232b438 keeps this header under multigrid/deprecated/.
+GCM=$TREE/Grid/algorithms/multigrid/deprecated/GeneralCoarsenedMatrix.h
 N04=$(grep -c 'Honour the checkerboard of the subspace' "$GCM" || true)
 [ "$N04" -ge 2 ] || { echo "ERROR: $GCM lacks patch 04 ($N04 of 2 hunks)." >&2; exit 1; }
 echo "OK: patch 04 present ($N04 hunks)."
@@ -64,7 +65,7 @@ check_used() {
   fi
   echo "OK: compiled $used"
 }
-check_used 'multigrid/GeneralCoarsenedMatrix.h$' "$GCM"
+check_used 'multigrid/deprecated/GeneralCoarsenedMatrix.h$' "$GCM"
 check_used 'pseudofermion/TwoFlavourSchurCloverAction.h$' "$TREE/Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverAction.h"
 
 echo "--- ldd: no QUDA, zero 'not found' ---"
