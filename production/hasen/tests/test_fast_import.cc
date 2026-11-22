@@ -102,9 +102,11 @@ Cmp compare(const F &a, const F &ref)
 // The 15 fields an import writes, as a copy.
 template <class Op>
 struct Snapshot {
-  decltype(Op::Umu) Umu, UmuEven, UmuOdd;
-  decltype(Op::Diagonal) D, De, Do, Di, Die, Dio;
-  decltype(Op::Triangle) T, Te, To, Ti, Tie, Tio;
+  // The operator's fields are references since the shared-operator-fields change (they
+  // point at owned or shared storage), so the copies take the type behind the reference.
+  typename std::remove_reference<decltype(Op::Umu)>::type Umu, UmuEven, UmuOdd;
+  typename std::remove_reference<decltype(Op::Diagonal)>::type D, De, Do, Di, Die, Dio;
+  typename std::remove_reference<decltype(Op::Triangle)>::type T, Te, To, Ti, Tie, Tio;
   explicit Snapshot(Op &op)
       : Umu(op.Umu.Grid()), UmuEven(op.UmuEven.Grid()), UmuOdd(op.UmuOdd.Grid()),
         D(op.Diagonal.Grid()), De(op.DiagonalEven.Grid()), Do(op.DiagonalOdd.Grid()),
