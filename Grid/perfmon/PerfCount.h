@@ -51,8 +51,12 @@ Author: paboyle <paboyle@ph.ed.ac.uk>
 #endif
 #ifdef __x86_64__
 #ifdef GRID_CUDA
-accelerator_inline uint64_t __rdtsc(void) {  return 0; }
-accelerator_inline uint64_t __rdpmc(int ) {  return 0; }
+// Upstream develop 3232b438 enabled these two stubs. With GCC 12 behind nvcc the x86
+// intrinsics header (reached through Eigen before this file) already declares __rdtsc and
+// __rdpmc returning unsigned long long, so the stubs are a second overload that differs in
+// return type only and PerfCount.cc and Stat.cc do not compile. Off again, as before.
+//accelerator_inline uint64_t __rdtsc(void) {  return 0; }
+//accelerator_inline uint64_t __rdpmc(int ) {  return 0; }
 #else
 #include <x86intrin.h>
 #endif
