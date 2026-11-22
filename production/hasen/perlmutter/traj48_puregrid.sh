@@ -506,9 +506,13 @@ done
 #   HASEN_GRID_RELIABLE_CG      reliable-update CG for the light mixed-CG solves (driver default
 #                               Delta 0.01 = QUDA's 0.1): QUDA's iteration counts, 48^3 -4.2%
 #                               force time; agrees to solver tolerance, not bitwise
+#   HASEN_GRID_FUSED_OUTER      (2026-11-21) the force's outer products in one GPU kernel each
+#                               (InsertForce4D, FusedCloverForce Accumulate): 48^3 -8.2% force
+#                               time, -3.1 GB peak, with the two above on; rounding only (16^3
+#                               H and plaquette at 3e-14, 48^3 force lines identical as printed)
 # Measured one at a time, not yet together on a whole trajectory
 # (__docs/2026_11_06_pure_hmc_optimisation_plan.md).
-for v in HASEN_GRID_SHARE_OP_FIELDS HASEN_GRID_RELIABLE_CG; do
+for v in HASEN_GRID_SHARE_OP_FIELDS HASEN_GRID_RELIABLE_CG HASEN_GRID_FUSED_OUTER; do
   if [ -z "${!v:-}" ] && [ "$(grep -c -a -F "$v" "$BIN" || true)" -gt 0 ]; then
     export "$v=1"
   fi
