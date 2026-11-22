@@ -88,6 +88,17 @@
 #include <type_traits>
 #include <vector>
 
+// Upstream Grid (develop 3232b438) moved the coarse operators this solver is built on to
+// Grid/algorithms/multigrid/deprecated/ and renamed them with a Deprecated prefix. The old
+// names live on here as aliases, in this one place, until the solver is ported to upstream's
+// new coarse operators. Every file of grid_mg includes this header.
+namespace Grid {
+template<class Fobj,class CComplex,int nbasis>
+using GeneralCoarsenedMatrix = DeprecatedGeneralCoarsenedMatrix<Fobj,CComplex,nbasis>;
+template<class Fobj,class CComplex,int nbasis>
+using MultiGeneralCoarsenedMatrix = DeprecatedMultiGeneralCoarsenedMatrix<Fobj,CComplex,nbasis>;
+}
+
 namespace ProbeMG {
 
 using namespace Grid;
