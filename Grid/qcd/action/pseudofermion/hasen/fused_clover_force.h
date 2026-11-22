@@ -158,10 +158,34 @@ class FusedCloverForce {
   int n_odd_ = 0;
   int n_even_ = 0;
 
+ public:  // nvcc refuses a __host__ __device__ lambda (accelerator_for) in a private member function
   static void Accumulate(PropagatorField &L, RealD coeff, const FermionField &X, const FermionField &Y)
   {
     conformable(X.Grid(), L.Grid());
     conformable(Y.Grid(), L.Grid());
+    // HASEN_GRID_FUSED_OUTER=1 (default off; the switch of WilsonImpl::InsertForce4D): one
+    // kernel, one 3x3 colour block (s1,s2) at a time, L(s1,s2) = L(s1,s2) + coeff * X(s1) (x)
+    // Y(s2)^dag, lane by lane with the tensor operators the two-kernel path below uses (the
+    // lattice axpy already runs lane by lane). No XY field, and Grid's lattice outerProduct
+    // (one thread per site doing every SIMD lane) is not launched.
+    static const bool fused = [](){ const char *e = getenv("HASEN_GRID_FUSED_OUTER"); return e && e[0]=='1'; }();
+    if (fused) {
+      const int Nsimd = PropagatorField::vector_object::Nsimd();
+      autoView(L_v, L, AcceleratorWrite);
+      autoView(X_v, X, AcceleratorRead);
+      autoView(Y_v, Y, AcceleratorRead);
+      accelerator_for(ss, L.Grid()->oSites(), Nsimd, {
+        for (int s1 = 0; s1 < Ns; s1++) {
+          auto x = coalescedRead(X_v[ss]()(s1));
+          for (int s2 = 0; s2 < Ns; s2++) {
+            auto y = coalescedRead(Y_v[ss]()(s2));
+            auto l = coalescedRead(L_v[ss]()(s1, s2));
+            coalescedWrite(L_v[ss]()(s1, s2), l + coeff * outerProduct(x, y));
+          }
+        }
+      });
+      return;
+    }
     // The body's `Impl::outerProductImpl(Lambda, Uf, Vf)` (patch line 294), whose body is
     // `mat = outerProduct(B, A)` (WilsonImpl.h:179-181), on the half grid. Grid's lattice
     // outerProduct returns a field with the default checkerboard; set it before the axpy.
@@ -171,6 +195,7 @@ class FusedCloverForce {
     L = L + coeff * XY;
   }
 
+ private:
   void Announce(const std::string &tag) const
   {
     if (tag.empty()) return;

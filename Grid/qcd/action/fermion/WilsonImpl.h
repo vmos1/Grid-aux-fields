@@ -171,10 +171,40 @@ public:
   }
 
   inline void InsertForce4D(GaugeField &mat, FermionField &Btilde, FermionField &A,int mu){
-    GaugeLinkField link(mat.Grid());
-    link = TraceIndex<SpinIndex>(outerProduct(Btilde,A)); 
-    PokeIndex<LorentzIndex>(mat,link,mu);
-  }   
+    // Runtime gate HASEN_GRID_FUSED_OUTER=1 (default off). Off: the lattice outerProduct builds
+    // the whole spin-colour matrix field (one GPU thread per site doing every SIMD lane; 764 MB
+    // fp64 on a 48x24^3 half grid), TraceIndex sums its spin diagonal, PokeIndex stores it. On:
+    // one kernel, the 4D twin of InsertForce5D below: each lane sums the colour outer products
+    // over spin and writes the colour matrix straight into mat(mu). Same sum order as
+    // traceIndex (zero, then spin 0..3).
+    static const bool fused = [](){ const char *e = getenv("HASEN_GRID_FUSED_OUTER"); return e && e[0]=='1'; }();
+    if (!fused) {
+      GaugeLinkField link(mat.Grid());
+      link = TraceIndex<SpinIndex>(outerProduct(Btilde,A));
+      PokeIndex<LorentzIndex>(mat,link,mu);
+      return;
+    }
+    // Not conformable(): in the Schur derivatives mat lives on a different (layout-equal) grid
+    // object than the fermions (see DhopDerivOE). The old path's PokeIndex walks mat's sites and
+    // reads the trace field at the same index; this kernel does the same, so require only that.
+    GRID_ASSERT(Btilde.Grid()->oSites() == mat.Grid()->oSites());
+    GRID_ASSERT(A.Grid()->oSites() == mat.Grid()->oSites());
+    const int Nsimd = SiteSpinor::Nsimd();
+    autoView( mat_v , mat, AcceleratorWrite);
+    autoView( Btilde_v , Btilde, AcceleratorRead);
+    autoView( A_v , A, AcceleratorRead);
+    accelerator_for(ss,mat.Grid()->oSites(),Nsimd,{
+      typedef decltype(coalescedRead(mat_v[ss](mu)() )) ColorMatrixType;
+      ColorMatrixType sum;
+      zeroit(sum);
+      for(int spn=0;spn<Ns;spn++){ //sum over spin
+        auto bb = coalescedRead(Btilde_v[ss]()(spn) ); //color vector
+        auto aa = coalescedRead(A_v[ss]()(spn) );
+        sum = sum + outerProduct(bb,aa);
+      }
+      coalescedWrite(mat_v[ss](mu)(), sum);
+    });
+  }
       
     inline void outerProductImpl(PropagatorField &mat, const FermionField &B, const FermionField &A){
       mat = outerProduct(B,A); 
