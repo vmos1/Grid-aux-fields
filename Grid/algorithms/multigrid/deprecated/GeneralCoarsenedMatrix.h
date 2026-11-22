@@ -31,16 +31,17 @@ Author: Peter Boyle <pboyle@bnl.gov>
 
 #include <Grid/lattice/PaddedCell.h>
 #include <Grid/stencil/GeneralLocalStencil.h>
+#include <Grid/algorithms/deflation/MultiRHSBlockProject.h>
 
 NAMESPACE_BEGIN(Grid);
 
 // Fine Object == (per site) type of fine field
 // nbasis      == number of deflation vectors
 template<class Fobj,class CComplex,int nbasis>
-class GeneralCoarsenedMatrix : public SparseMatrixBase<Lattice<iVector<CComplex,nbasis > > >  {
+class DeprecatedGeneralCoarsenedMatrix : public SparseMatrixBase<Lattice<iVector<CComplex,nbasis > > >  {
 public:
 
-  typedef GeneralCoarsenedMatrix<Fobj,CComplex,nbasis> GeneralCoarseOp;
+  typedef DeprecatedGeneralCoarsenedMatrix<Fobj,CComplex,nbasis> GeneralCoarseOp;
   typedef iVector<CComplex,nbasis >           siteVector;
   typedef iMatrix<CComplex,nbasis >           siteMatrix;
   typedef Lattice<iScalar<CComplex> >         CoarseComplexField;
@@ -66,9 +67,24 @@ public:
   std::vector<CoarseMatrix> _Adag;
   std::vector<CoarseVector> MultTemporaries;
 
+  int64_t MultCalls;
+  double  MultFlopsAccum;
+  double  MultUsecAccum;
+
   ///////////////////////
   // Interface
   ///////////////////////
+  //////////////////////////////////////////////////////////////////////////
+  // Bilingual accessors: everything a consumer needs to read the operator
+  // without knowing which of the three coarse classes it holds. The D
+  // dimensional grid the elements live on, the geometry they are indexed by,
+  // and one unpadded point at a time (a whole npoint vector is too much
+  // memory at production nbasis).
+  //////////////////////////////////////////////////////////////////////////
+  GridCartesian * CoarseGridD(void)             { return _CoarseGrid; };
+  NonLocalStencilGeometry & Geometry(void)      { return geom; };
+  void ExtractMatrix(int p,CoarseMatrix &A)     { A = Cell.Extract(_A[p]); };
+
   GridBase      * Grid(void)           { return _CoarseGrid; };   // this is all the linalg routines need to know
   GridBase      * FineGrid(void)       { return _FineGrid; };   // this is all the linalg routines need to know
   GridCartesian * CoarseGrid(void)     { return _CoarseGrid; };   // this is all the linalg routines need to know
@@ -87,7 +103,7 @@ public:
   void ProjectNearestNeighbour(RealD shift, GeneralCoarseOp &CopyMe)
   {
     int nfound=0;
-    std::cout << GridLogMessage <<"GeneralCoarsenedMatrix::ProjectNearestNeighbour "<< CopyMe._A[0].Grid()<<std::endl;
+    std::cout << GridLogMessage <<"DeprecatedGeneralCoarsenedMatrix::ProjectNearestNeighbour "<< CopyMe._A[0].Grid()<<std::endl;
     for(int p=0;p<geom.npoint;p++){
       for(int pp=0;pp<CopyMe.geom.npoint;pp++){
  	// Search for the same relative shift
@@ -104,13 +120,14 @@ public:
   }
   */
   
-  GeneralCoarsenedMatrix(NonLocalStencilGeometry &_geom,GridBase *FineGrid, GridCartesian * CoarseGrid)
+  DeprecatedGeneralCoarsenedMatrix(NonLocalStencilGeometry &_geom,GridBase *FineGrid, GridCartesian * CoarseGrid,int _herm=1)
     : geom(_geom),
       _FineGrid(FineGrid),
       _CoarseGrid(CoarseGrid),
-      hermitian(1),
+      hermitian(_herm),
       Cell(_geom.Depth(),_CoarseGrid),
-      Stencil(Cell.grids.back(),geom.shifts)
+      Stencil(Cell.grids.back(),geom.shifts),
+      MultCalls(0), MultFlopsAccum(0.0), MultUsecAccum(0.0)
   {
     {
       int npoint = _geom.npoint;
@@ -122,7 +139,11 @@ public:
     // not initialised, so the copies only moved uninitialised memory: nothing else changes.
     _A.reserve(geom.npoint);
     for(int p=0;p<geom.npoint;p++) _A.emplace_back(CoarseGrid);
-    //    _Adag.resize(geom.npoint,CoarseGrid);
+    // _Adag (upstream, non-Hermitian operators only) built the same way.
+    if ( !hermitian ) {
+      _Adag.reserve(geom.npoint);
+      for(int p=0;p<geom.npoint;p++) _Adag.emplace_back(CoarseGrid);
+    }
   }
   void M (const CoarseVector &in, CoarseVector &out)
   {
@@ -130,10 +151,10 @@ public:
   }
   void Mdag (const CoarseVector &in, CoarseVector &out)
   {
-    GRID_ASSERT(hermitian);
-    Mult(_A,in,out);
-    //    if ( hermitian ) M(in,out);
-    //    else Mult(_Adag,in,out);
+    if(hermitian)
+      Mult(_A,in,out);
+    else
+      Mult(_Adag,in,out);
   }
   void Mult (std::vector<CoarseMatrix> &A,const CoarseVector &in, CoarseVector &out)
   {
@@ -233,29 +254,28 @@ public:
     text+=usecond();
     ttot+=usecond();
     
-    std::cout << GridLogPerformance<<"Coarse 1rhs Mult Aviews "<<tviews<<" us"<<std::endl;
-    std::cout << GridLogPerformance<<"Coarse Mult exch "<<texch<<" us"<<std::endl;
-    std::cout << GridLogPerformance<<"Coarse Mult mult "<<tmult<<" us"<<std::endl;
-    std::cout << GridLogPerformance<<" of which mult2  "<<tmult2<<" us"<<std::endl;
-    std::cout << GridLogPerformance<<"Coarse Mult ext  "<<text<<" us"<<std::endl;
-    std::cout << GridLogPerformance<<"Coarse Mult temps "<<ttemps<<" us"<<std::endl;
-    std::cout << GridLogPerformance<<"Coarse Mult copy  "<<tcopy<<" us"<<std::endl;
-    std::cout << GridLogPerformance<<"Coarse Mult tot  "<<ttot<<" us"<<std::endl;
-    //    std::cout << GridLogPerformance<<std::endl;
-    std::cout << GridLogPerformance<<"Coarse Kernel flops "<< flops<<std::endl;
-    std::cout << GridLogPerformance<<"Coarse Kernel flop/s "<< flops/tmult<<" mflop/s"<<std::endl;
-    std::cout << GridLogPerformance<<"Coarse Kernel bytes/s "<< bytes/tmult<<" MB/s"<<std::endl;
-    std::cout << GridLogPerformance<<"Coarse overall flops/s "<< flops/ttot<<" mflop/s"<<std::endl;
-    std::cout << GridLogPerformance<<"Coarse total bytes   "<< bytes/1e6<<" MB"<<std::endl;
+    MultCalls++;
+    MultFlopsAccum += flops;
+    MultUsecAccum  += ttot;
+    std::cout << GridLogPerformance
+	      << "Coarse Mult call " << MultCalls
+	      << "  tot " << ttot << " us"
+	      << "  kernel " << tmult << " us"
+	      << "  kernel " << flops/tmult*1e-3 << " GFlop/s"
+	      << "  overall " << MultFlopsAccum/MultUsecAccum*1e-3 << " GFlop/s (cumul)"
+	      << "  bw " << bytes/tmult*1e-3 << " GB/s"
+	      << std::endl;
 
   };
   
   void PopulateAdag(void)
   {
+#if 0
+    // Serial global peek/poke reference implementation
     for(int64_t bidx=0;bidx<CoarseGrid()->gSites() ;bidx++){
       Coordinate bcoor;
       CoarseGrid()->GlobalIndexToGlobalCoor(bidx,bcoor);
-      
+
       for(int p=0;p<geom.npoint;p++){
 	Coordinate scoor = bcoor;
 	for(int mu=0;mu<bcoor.size();mu++){
@@ -268,6 +288,36 @@ public:
 	pokeSite(adj(link),_Adag[pp],bcoor);
       }
     }
+#else
+    // Parallel: _Adag[pp](x) = adj( _A[p](x + s_pp) ),  pp = Reverse(p), s_pp = -s_p.
+    // The neighbour fetch reuses the same padded-cell + stencil machinery as Mult,
+    // reading one matrix element per coalesced access so no whole site matrix
+    // (230KB at nbasis=60) ever lands on a GPU thread stack (HIP limit 128KB).
+    // Halo sites compute garbage neighbours; Cell.Extract discards them.
+    // Must run on the unpadded _A, i.e. before ExchangeCoarseLinks.
+    const int Nsimd = CComplex::Nsimd();
+    for(int p=0;p<geom.npoint;p++){
+      int pp = geom.Reverse(p);
+      CoarseMatrix Apad = Cell.ExchangePeriodic(_A[p]);
+      CoarseMatrix Dpad(Apad.Grid());
+      int64_t osites = Apad.Grid()->oSites();
+      {
+	autoView( Apad_v   , Apad, AcceleratorRead);
+	autoView( Dpad_v   , Dpad, AcceleratorWriteDiscard);
+	autoView( Stencil_v, Stencil, AcceleratorRead);
+	accelerator_for(sj, osites*nbasis, Nsimd, {
+	    int32_t ss = sj/nbasis;
+	    int32_t j  = sj%nbasis;
+	    auto SE = Stencil_v.GetEntry(pp,ss);
+	    for(int i=0;i<nbasis;i++){
+	      auto z = coalescedReadGeneralPermute(Apad_v[SE->_offset](i,j),SE->_permute,Nd);
+	      coalescedWrite(Dpad_v[ss](j,i),conjugate(z));
+	    }
+	});
+      }
+      _Adag[pp] = Cell.Extract(Dpad);
+    }
+#endif
   }
   /////////////////////////////////////////////////////////////
   // 
@@ -428,10 +478,19 @@ public:
 	int osites=CoarseGrid()->oSites();
 	autoView( A_v  , _A[k], AcceleratorWrite);
 	autoView( FT_v  , FT[k], AcceleratorRead);
-	accelerator_for(sss, osites, 1, {
+	accelerator_for(sss, osites, nbasis, {
+#ifdef GRID_SIMT
+	    int j = acceleratorSIMTlane(nbasis);
+	    A_v[sss](i,j) = FT_v[sss](j);
+#else
+	    // CPU build: acceleratorSIMTlane()==0 -- an un-looped SIMT tensor
+	    // index writes ONLY j=0 and silently drops the other nbasis-1
+	    // columns (caught by Test_schur_dense_coarse import certificate,
+	    // 2026-08-14).  Loop explicitly.
 	    for(int j=0;j<nbasis;j++){
 	      A_v[sss](i,j) = FT_v[sss](j);
 	    }
+#endif
         });
       }
       tinv+=usecond();
@@ -439,8 +498,8 @@ public:
 
     // Only needed if nonhermitian
     if ( ! hermitian ) {
-      //      std::cout << GridLogMessage<<"PopulateAdag  "<<std::endl;
-      //      PopulateAdag();
+      std::cout << GridLogMessage<<"PopulateAdag  "<<std::endl;
+      PopulateAdag();
     }
 
     // Need to write something to populate Adag from A
@@ -528,13 +587,9 @@ public:
     // Now compute the matrix elements of linop between the orthonormal
     // set of vectors.
     ///////////////////////////////////////////////////////////////////////
-    FineField phaV(grid); // Phased block basis vector
-    FineField MphaV(grid);// Matrix applied
     std::vector<FineComplexField> phaF(npoint,grid);
     std::vector<CoarseComplexField> pha(npoint,CoarseGrid());
-    
-    CoarseVector coarseInner(CoarseGrid());
-    
+
     typedef typename CComplex::scalar_type SComplex;
     FineComplexField one(grid); one=SComplex(1.0);
     FineComplexField zz(grid); zz = Zero();
@@ -547,8 +602,6 @@ public:
       const int cb = V.subspace[0].Checkerboard();
       one.Checkerboard()   = cb;
       zz.Checkerboard()    = cb;
-      phaV.Checkerboard()  = cb;
-      MphaV.Checkerboard() = cb;
       for(int p=0;p<npoint;p++) phaF[p].Checkerboard() = cb;
     }
     tphase=-usecond();
@@ -566,37 +619,58 @@ public:
       pha[p]  =exp(pha[p]*ci);
 
       blockZAXPY(phaF[p],pha[p],one,zz);
-      
+
     }
     tphase+=usecond();
-    
-    std::vector<CoarseVector> ComputeProj(npoint,CoarseGrid());
-    std::vector<CoarseVector>          FT(npoint,CoarseGrid());
+
+    // Import basis into BLAS layout once; blockProject then reads it once per
+    // basis vector rather than once per (i,p) as in scalar blockProject.
+    // Process all npoint in a single batch.
+    MultiRHSBlockProject<FineField> Projector;
+    Projector.Allocate(nbasis, grid, CoarseGrid());
+    Projector.ImportBasis(U.subspace);
+
+    std::vector<FineField>    phaV_batch(npoint, grid);
+    std::vector<FineField>    MphaV_batch(npoint, grid);
+    // Checkerboard of the subspace, as above: upstream's batched loop replaced the single
+    // phaV and MphaV temporaries by these, so they take the checkerboard here.
+    for(int p=0;p<npoint;p++){
+      phaV_batch[p].Checkerboard()  = V.subspace[0].Checkerboard();
+      MphaV_batch[p].Checkerboard() = V.subspace[0].Checkerboard();
+    }
+    std::vector<CoarseVector> proj_batch(npoint, CoarseGrid());
+    std::vector<CoarseVector> ComputeProj(npoint, CoarseGrid());
+    std::vector<CoarseVector>          FT(npoint, CoarseGrid());
+
+    // Pre-allocate BLAS_F and BLAS_C to avoid repeated hipMalloc/hipFree of
+    // ~5.6 GB per blockProject call, which hangs on ROCm for large allocations.
+    Projector.BLAS_F.resize(Projector.fine_vol * Projector.words * npoint);
+    Projector.BLAS_C.resize(Projector.coarse_vol * nbasis * npoint);
+
     for(int i=0;i<nbasis;i++){// Loop over basis vectors
+      accelerator_barrier(); // ensure prior iteration's async writes are retired
       std::cout << GridLogMessage<< "CoarsenMatrixColoured vec "<<i<<"/"<<nbasis<< std::endl;
-      for(int p=0;p<npoint;p++){ // Loop over momenta in npoint
-	tphaseBZ-=usecond();
-	phaV = phaF[p]*V.subspace[i];
-	tphaseBZ+=usecond();
 
-	/////////////////////////////////////////////////////////////////////
-	// Multiple phased subspace vector by matrix and project to subspace
-	// Remove local bulk phase to leave relative phases
-	/////////////////////////////////////////////////////////////////////
-	tmat-=usecond();
-	linop.Op(phaV,MphaV);
-	tmat+=usecond();
-	//	std::cout << i << " " <<p << " MphaV "<<norm2(MphaV)<<" "<<norm2(phaV)<<std::endl;
+      tphaseBZ-=usecond();
+      for(int p=0;p<npoint;p++)
+	phaV_batch[p] = phaF[p] * V.subspace[i];
+      tphaseBZ+=usecond();
+      std::cout << GridLogMessage<< "CoarsenMatrixColoured vec "<<i<<" phaseBZ done"<< std::endl;
 
-	tproj-=usecond();
-	blockProject(coarseInner,MphaV,U.subspace);
-	coarseInner = conjugate(pha[p]) * coarseInner;
+      tmat-=usecond();
+      for(int p=0;p<npoint;p++)
+	linop.Op(phaV_batch[p], MphaV_batch[p]);
+      tmat+=usecond();
+      std::cout << GridLogMessage<< "CoarsenMatrixColoured vec "<<i<<" mat done"<< std::endl;
 
-	ComputeProj[p] = coarseInner;
-	tproj+=usecond();
-	//	std::cout << i << " " <<p << " ComputeProj "<<norm2(ComputeProj[p])<<std::endl;
-
-      }
+      // One batched GEMM reads BLAS_V once for all npoint vectors.
+      tproj-=usecond();
+      Projector.blockProject(MphaV_batch, proj_batch);
+      std::cout << GridLogMessage<< "CoarsenMatrixColoured vec "<<i<<" blockProject done"<< std::endl;
+      for(int p=0;p<npoint;p++)
+	ComputeProj[p] = conjugate(pha[p]) * proj_batch[p];
+      tproj+=usecond();
+      std::cout << GridLogMessage<< "CoarsenMatrixColoured vec "<<i<<" proj done"<< std::endl;
 
       tinv-=usecond();
       for(int k=0;k<npoint;k++){
@@ -604,14 +678,23 @@ public:
 	for(int l=0;l<npoint;l++){
 	  FT[k]= FT[k]+ invMkl(l,k)*ComputeProj[l];
 	}
-      
+
 	int osites=CoarseGrid()->oSites();
 	autoView( A_v  , _A[k], AcceleratorWrite);
 	autoView( FT_v  , FT[k], AcceleratorRead);
-	accelerator_for(sss, osites, 1, {
+	accelerator_for(sss, osites, nbasis, {
+#ifdef GRID_SIMT
+	    int j = acceleratorSIMTlane(nbasis);
+	    A_v[sss](i,j) = FT_v[sss](j);
+#else
+	    // CPU build: acceleratorSIMTlane()==0 -- an un-looped SIMT tensor
+	    // index writes ONLY j=0 and silently drops the other nbasis-1
+	    // columns (caught by Test_schur_dense_coarse import certificate,
+	    // 2026-08-14).  Loop explicitly.
 	    for(int j=0;j<nbasis;j++){
 	      A_v[sss](i,j) = FT_v[sss](j);
 	    }
+#endif
         });
       }
       tinv+=usecond();
@@ -619,15 +702,18 @@ public:
 
     // Only needed if nonhermitian
     if ( ! hermitian ) {
-      //      std::cout << GridLogMessage<<"PopulateAdag  "<<std::endl;
-      //      PopulateAdag();
+      std::cout << GridLogMessage<<"PopulateAdag  "<<std::endl;
+      PopulateAdag();
     }
 
     // A diagnostic print of norm2(_A[p]) for every point stood here. Its reduction kernel holds
     // whole nbasis x nbasis site matrices in thread-local memory (55 KB per thread at nbasis 48,
     // fp32), and CUDA keeps the largest stack reservation any kernel has asked for, for every
     // thread the card can run, until the end of the program: 11.9 GB of an A100's 40 GB, taken
-    // by one log line (grid-perf-profile, 2026-11-16). Removed; nothing reads the value.
+    // by one log line (grid-perf-profile, 2026-11-16). Upstream has it commented out; keep it off.
+    //    for(int p=0;p<geom.npoint;p++){
+    //      std::cout << " _A["<<p<<"] "<<norm2(_A[p])<<std::endl;
+    //    }
 
     // Need to write something to populate Adag from A
     ExchangeCoarseLinks();
@@ -639,27 +725,31 @@ public:
     std::cout << GridLogMessage<<"CoarsenOperator inv    "<<tinv<<" us"<<std::endl;
   }
 #endif  
-  void ExchangeCoarseLinks(void){
-    // Was _A[p] = Cell.ExchangePeriodic(_A[p]). ExchangePeriodic copies its input once, and
-    // once more for every dimension that is not split over ranks (PaddedCell keeps the same
-    // grid there, so the "expansion" is a copy). The copy kernel of an nbasis x nbasis link
-    // field holds two site matrices in thread-local memory (37 KB per thread at nbasis 48),
-    // which reserves 8 GB of an A100 for the rest of the run. _A[p] is overwritten anyway:
-    // move it, and expand only the split dimensions with ExpandPeriodic's own steps for them
-    // (a new field on Cell.grids[d], Face_exchange into it), called here so that its copy
-    // branch is not even compiled for the link type. The same data lands on the same grids,
-    // so the result is bit-identical.
-    for(int p=0;p<geom.npoint;p++){
-      CoarseMatrix tmp = std::move(_A[p]);
-      for(int d=0;d<tmp.Grid()->Nd();d++){
-	if ( tmp.Grid()->_processors[d] > 1 ) {
-	  CoarseMatrix padded(Cell.grids[d]);
-	  Cell.Face_exchange(tmp,padded,d,Cell.depth);
-	  tmp = std::move(padded);
-	}
+  // Was A = Cell.ExchangePeriodic(A). ExchangePeriodic copied its input once, and once more
+  // for every dimension that is not split over ranks (PaddedCell keeps the same grid there, so
+  // the "expansion" is a copy). The copy kernel of an nbasis x nbasis link field holds two site
+  // matrices in thread-local memory (37 KB per thread at nbasis 48), which reserves 8 GB of an
+  // A100 for the rest of the run. The link field is overwritten anyway: move it, and expand
+  // only the split dimensions with ExpandPeriodic's own steps for them (a new field on
+  // Cell.grids[d], Face_exchange into it), called here so that its copy branch is not even
+  // compiled for the link type. The same data lands on the same grids, so the result is
+  // bit-identical. (Upstream's ExchangePeriodic now skips the unsplit dimensions too; this
+  // stays until the memory is re-measured without it.)
+  void ExchangeLinkField(CoarseMatrix &A){
+    CoarseMatrix tmp = std::move(A);
+    for(int d=0;d<tmp.Grid()->Nd();d++){
+      if ( tmp.Grid()->_processors[d] > 1 ) {
+	CoarseMatrix padded(Cell.grids[d]);
+	Cell.Face_exchange(tmp,padded,d,Cell.depth);
+	tmp = std::move(padded);
       }
-      _A[p] = std::move(tmp);
-      //      _Adag[p]= Cell.ExchangePeriodic(_Adag[p]);
+    }
+    A = std::move(tmp);
+  }
+  void ExchangeCoarseLinks(void){
+    for(int p=0;p<geom.npoint;p++){
+      ExchangeLinkField(_A[p]);
+      if ( !hermitian ) ExchangeLinkField(_Adag[p]);
     }
   }
   virtual  void Mdiag    (const Field &in, Field &out){ GRID_ASSERT(0);};

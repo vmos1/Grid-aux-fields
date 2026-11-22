@@ -78,6 +78,20 @@ public:
     GRID_ASSERT(U.Checkerboard()==V.Checkerboard());
     const bool input_odd = (U.Checkerboard()==Odd);
 
+    // Forces returned on the full 4D grid (checkerboard including s): same sequence, summed
+    if ( !this->_Mat.CheckerboardedForce() ) {
+      GaugeField ForceO(Force.Grid());
+      GaugeField ForceE(Force.Grid());
+      this->_Mat.Meooe   (V,tmp1);
+      this->_Mat.MooeeInv(tmp1,tmp2);
+      this->_Mat.MoeDeriv(ForceO,U,tmp2,DaggerNo);
+      this->_Mat.MeooeDag   (U,tmp1);
+      this->_Mat.MooeeInvDag(tmp1,tmp2);
+      this->_Mat.MeoDeriv(ForceE,tmp2,V,DaggerNo);
+      Force = -(ForceO+ForceE);
+      return;
+    }
+
     // NOTE Guido: WE DO NOT WANT TO USE THE ucbgrid GRID FOR THE FORCE
     // it is not conformable with the HMC force field
     // Case: Ls vectorised fields
@@ -124,6 +138,23 @@ public:
     GRID_ASSERT(U.Checkerboard()==V.Checkerboard());
     const bool input_odd = (V.Checkerboard()==Odd);
 
+    // Forces returned on the full 4D grid (checkerboard including s): same sequence, summed
+    if ( !this->_Mat.CheckerboardedForce() ) {
+      GaugeField ForceO(Force.Grid());
+      GaugeField ForceE(Force.Grid());
+      this->_Mat.MeooeDag   (V,tmp1);
+      this->_Mat.MooeeInvDag(tmp1,tmp2);
+      this->_Mat.MoeDeriv(ForceO,U,tmp2,DaggerYes);
+      this->_Mat.Meooe   (U,tmp1);
+      this->_Mat.MooeeInv(tmp1,tmp2);
+      this->_Mat.MeoDeriv(ForceE,tmp2,V,DaggerYes);
+      Force = -(ForceO+ForceE);
+      return;
+    }
+
+    // NOTE Guido: WE DO NOT WANT TO USE THE ucbgrid GRID FOR THE FORCE
+    // it is not conformable with the HMC force field
+    // INHERIT FROM THE Force field instead
     GridRedBlackCartesian* forcecb = new GridRedBlackCartesian(Force.Grid());
     GaugeField ForceO(forcecb);
     GaugeField ForceE(forcecb);
