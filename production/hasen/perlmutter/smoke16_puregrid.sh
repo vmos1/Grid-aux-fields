@@ -58,6 +58,20 @@
 # Exactly one family per run. The ENV line records the resolved knobs (STRANGE_LEVEL,
 # STRANGE_INNER_MULT, STRANGE_RUNGS, LEVEL_* fields appended at its end).
 #
+# Checkpoint inputs (2026-11-23, for the checkpoint write and read-back gate of a new Grid
+# base; unset = the frozen recipe: one trajectory, no checkpoint, as before). Read in
+# section 1, BEFORE the section-3 scrub clears CKPT_*, applied in section 5:
+#   SMOKE_N_TRAJ=<n>            trajectories (default 1)
+#   SMOKE_CKPT_DIR=<dir>        an existing folder: the driver's checkpointer saves
+#                               ckpoint_lat.<n> and ckpoint_rng.<n> there after every
+#                               trajectory (CKPT_DIR, CKPT_INTERVAL=1)
+#   SMOKE_CKPT_RESUME_TRAJ=<n>  resume from <dir>/ckpoint_lat.<n> and ckpoint_rng.<n>
+#                               (CKPT_RESUME_TRAJ): the gauge field and both RNG states come
+#                               from the files, IMPORT_CFG and the seed are not used. Needs
+#                               SMOKE_CKPT_DIR. The run saves into the same folder, so give a
+#                               resumed run its own folder holding links to the two files.
+# The ENV line records them (N_TRAJ, and CKPT_DIR, CKPT_RESUME_TRAJ appended at its end).
+#
 # Estimated wall time: the identical physics on the QUDA hybrid took 130 s for
 # trajectory 1 on 4 GPUs (runs/2026_7_11_three_level_recheck_tol11_16/case_qf2.log);
 # pure Grid CG is expected to be several times slower. Timeout is 60 min.
@@ -88,6 +102,20 @@ LEVEL_FAMILY=no
 LEGACY_FAMILY=no
 [ -z "$L_STRANGE_LEVEL$L_STRANGE_MULT$L_TAIL_LEVEL$L_GAUGE_MULT" ] || LEGACY_FAMILY=yes
 [ "$LEVEL_FAMILY" = no ] || [ "$LEGACY_FAMILY" = no ] || die "CUSTOM_LEVEL_* and CUSTOM_STRANGE_LEVEL / CUSTOM_STRANGE_INNER_MULT / CUSTOM_TAIL_LEVEL / DIAG_GAUGE_INNER_MULT are two layout families; give exactly one"
+# Checkpoint inputs (header): read here, before the section-3 scrub, applied in section 5.
+S_N_TRAJ=${SMOKE_N_TRAJ:-1} S_CKPT_DIR=${SMOKE_CKPT_DIR:-} S_CKPT_RESUME=${SMOKE_CKPT_RESUME_TRAJ:-}
+[[ "$S_N_TRAJ" =~ ^[1-9][0-9]*$ ]] || die "SMOKE_N_TRAJ must be a positive integer, got '$S_N_TRAJ'"
+if [ -n "$S_CKPT_DIR" ]; then
+  [ -d "$S_CKPT_DIR" ] || die "SMOKE_CKPT_DIR is not an existing folder: $S_CKPT_DIR"
+  S_CKPT_DIR=$(readlink -f "$S_CKPT_DIR")
+fi
+if [ -n "$S_CKPT_RESUME" ]; then
+  [[ "$S_CKPT_RESUME" =~ ^[0-9]+$ ]] || die "SMOKE_CKPT_RESUME_TRAJ must be a trajectory number, got '$S_CKPT_RESUME'"
+  [ -n "$S_CKPT_DIR" ] || die "SMOKE_CKPT_RESUME_TRAJ needs SMOKE_CKPT_DIR"
+  for f in ckpoint_lat ckpoint_rng; do
+    [ -e "$S_CKPT_DIR/$f.$S_CKPT_RESUME" ] || die "resume file missing: $S_CKPT_DIR/$f.$S_CKPT_RESUME"
+  done
+fi
 
 # The allocation must already exist; this script only attaches srun steps to it.
 # (squeue is read-only.)
@@ -231,7 +259,12 @@ export TRAJL=0.35355339059327379
 # MDSTEPS=4: 16^3 recipes (MDSTEPS=20 timed out at 30 min on 1 GPU,
 # gridcg_ladder_short_traj_16.sbatch header; the A/B recipe used 4).
 export MDSTEPS=4
-export N_TRAJ=1
+export N_TRAJ=$S_N_TRAJ                                   # 1 unless SMOKE_N_TRAJ (header)
+# Checkpointer (header, "Checkpoint inputs"): off unless SMOKE_CKPT_DIR is given.
+if [ -n "$S_CKPT_DIR" ]; then
+  export CKPT_DIR=$S_CKPT_DIR CKPT_INTERVAL=1
+  [ -z "$S_CKPT_RESUME" ] || export CKPT_RESUME_TRAJ=$S_CKPT_RESUME
+fi
 # Metropolis ON: NO_METROP stays unset -> NoMetropolisUntil=0 (driver HMC block).
 # NOTE: on a REJECT the "Plaquette: [ 1 ]" line is the START config, not the
 # post-MD one; dH ("Total H after trajectory ... dH =") is printed either way.
@@ -330,7 +363,7 @@ GRID_SHA=${GRID_HASH_LINE:0:40}
 GRID_SHA=${GRID_SHA:-unknown}
 case "$GRID_HASH_LINE" in *uncommit*) GRID_DIRTY=yes ;; *) GRID_DIRTY=no ;; esac
 
-printf 'ENV SMOKE16_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s LATT=%s MPI=%s NTASKS=%s IMPORT_CFG=%s SEED=%s N_TRAJ=%s MDSTEPS=%s TRAJL=%s INTEGRATOR=%s GAUGE_INNER_MULT=%s LADDER=%s TAIL_LEVEL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s METROP=on QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s GRID_MG_RUNGS=%s GRID_MG_HB=%s GRID_MIXED=%s GRID_MIXED_HB=%s GRID_MG_ENV="%s" GRID_FLAGS="%s" STRANGE_LEVEL=%s STRANGE_INNER_MULT=%s STRANGE_RUNGS=%s LEVEL_LIGHT=%s LEVEL_STRANGE=%s LEVEL_TAIL=%s LEVEL_GAUGE=%s LEVEL_MULT=%s\n' \
+printf 'ENV SMOKE16_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s LATT=%s MPI=%s NTASKS=%s IMPORT_CFG=%s SEED=%s N_TRAJ=%s MDSTEPS=%s TRAJL=%s INTEGRATOR=%s GAUGE_INNER_MULT=%s LADDER=%s TAIL_LEVEL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s METROP=on QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s GRID_MG_RUNGS=%s GRID_MG_HB=%s GRID_MIXED=%s GRID_MIXED_HB=%s GRID_MG_ENV="%s" GRID_FLAGS="%s" STRANGE_LEVEL=%s STRANGE_INNER_MULT=%s STRANGE_RUNGS=%s LEVEL_LIGHT=%s LEVEL_STRANGE=%s LEVEL_TAIL=%s LEVEL_GAUGE=%s LEVEL_MULT=%s CKPT_DIR=%s CKPT_RESUME_TRAJ=%s\n' \
   "$RUN" "$SLURM_JOB_ID" "$(basename "$BIN")" "$BIN_SHA256" "$GRID_SHA" "$GRID_DIRTY" \
   "$LATT" "$MPI_GEOM" "$NTASKS" "$(basename "$IMPORT_CFG")" "$HMC_SEED_OFFSET" "$N_TRAJ" \
   "$MDSTEPS" "$TRAJL" "$INTEGRATOR" "${GAUGE_INNER_MULT:-none}" "$HASEN_LADDER" "${HASEN_TAIL_LEVEL:-none}" \
@@ -341,7 +374,8 @@ printf 'ENV SMOKE16_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GR
   "${HASEN_GRID_MIXED_CG_RUNGS:-none}" "${HASEN_GRID_MIXED_CG_HEATBATH_RUNGS:-none}" \
   "$(compgen -e | grep -E '^(GRID_MG_|HASEN_GRID_|STRANGE_EVEN$)' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
   "${GRID_ARGS[*]}" "${HASEN_STRANGE_LEVEL:-default}" "${HASEN_STRANGE_INNER_MULT:-default}" "${HASEN_STRANGE_RUNGS:-none}" \
-  "${HASEN_LEVEL_LIGHT:-none}" "${HASEN_LEVEL_STRANGE:-none}" "${HASEN_LEVEL_TAIL:-none}" "${HASEN_LEVEL_GAUGE:-none}" "$LEVEL_MULT_TAG" > "$LOG"
+  "${HASEN_LEVEL_LIGHT:-none}" "${HASEN_LEVEL_STRANGE:-none}" "${HASEN_LEVEL_TAIL:-none}" "${HASEN_LEVEL_GAUGE:-none}" "$LEVEL_MULT_TAG" \
+  "${CKPT_DIR:-none}" "${CKPT_RESUME_TRAJ:-none}" > "$LOG"
 {
   printf 'GRID_HASH %s\n' "${GRID_HASH_LINE:-unknown}"
   printf 'BIN_PATH %s\n' "$BIN"
