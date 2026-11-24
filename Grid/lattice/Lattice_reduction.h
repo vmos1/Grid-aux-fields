@@ -236,15 +236,21 @@ template<class vobj> inline RealD maxLocalNorm2(const Lattice<vobj> &arg)
   auto grid = arg.Grid();
 
   RealD max;
-  for(int l=0;l<grid->lSites();l++){
-    Coordinate coor;
-    scalar val;
-    RealD r;
-    grid->LocalIndexToLocalCoor(l,coor);
-    peekLocalSite(val,inner,coor);
-    r=real(TensorRemove(val));
-    if( (l==0) || (r>max)){
-      max=r;
+  {
+    // One host view for the whole loop. peekLocalSite on the Lattice opens and closes a view
+    // per site, and for a field with a device copy each such pair removes the entry from the
+    // memory manager's LRU list and puts it back.
+    autoView(inner_v,inner,CpuRead);
+    for(int l=0;l<grid->lSites();l++){
+      Coordinate coor;
+      scalar val;
+      RealD r;
+      grid->LocalIndexToLocalCoor(l,coor);
+      peekLocalSite(val,inner_v,coor);
+      r=real(TensorRemove(val));
+      if( (l==0) || (r>max)){
+	max=r;
+      }
     }
   }
   grid->GlobalMax(max);
