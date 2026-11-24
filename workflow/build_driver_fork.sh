@@ -40,6 +40,15 @@ CXX=$("$GRID_CONFIG" --cxx)
 CXXFLAGS="-I$HB -I$HB/src -I$TREE -I$BUILD/Grid $("$GRID_CONFIG" --cxxflags)"
 LDFLAGS="$("$GRID_CONFIG" --ldflags) -L$BUILD/Grid"
 LIBS=$("$GRID_CONFIG" --libs)
+# The HMC driver uses no HDF5 symbol, and it must not load the HDF5 libraries: Cray's
+# libhdf5_cpp brings libgfortran and libquadmath, and libquadmath registers printf hooks when
+# it is loaded, which put every printf of the process on glibc's slow path (1.7 times per call).
+# The CUDA driver formats a string on every MPI call of Cray's GPU transport layer, so this
+# costs 0.26 ms per multigrid V-cycle at 48^3 (profile of 2026-11-24). HDF5 stays on in libGrid
+# for the programs that use it. DRIVER_HDF5=1 keeps the two libraries for a driver that does.
+if [ "${DRIVER_HDF5:-0}" != 1 ]; then
+  LIBS=$(printf '%s\n' $LIBS | grep -v -x -e '-lhdf5_cpp' -e '-lhdf5' | tr '\n' ' ')
+fi
 
 SHA=$(git -C "$TREE" rev-parse --short HEAD)
 DIRTY=$(git -C "$TREE" status --porcelain --untracked-files=no | wc -l)
@@ -79,6 +88,12 @@ if [ "$NOTFOUND" -ne 0 ]; then
   exit 1
 fi
 echo "OK: ldd reports 0 'not found'."
+if [ "${DRIVER_HDF5:-0}" != 1 ] && echo "$LDD_OUT" | grep -q -E 'libquadmath|libhdf5'; then
+  echo "ERROR: the driver loads HDF5 or libquadmath (printf hooks, see the note at LIBS):" >&2
+  echo "$LDD_OUT" | grep -E 'libquadmath|libhdf5|libgfortran' >&2
+  exit 1
+fi
+echo "OK: no HDF5 library and no libquadmath loaded."
 
 mkdir -p "$INSTALL_BIN"
 cp -p "$BIN" "$BIN.provenance" "$INSTALL_BIN/"
